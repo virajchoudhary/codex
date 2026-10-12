@@ -2118,6 +2118,116 @@ fn vec_str(items: &[&str]) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn windows_false_shell_execute_assignment_respects_exec_policy() {
+    let command = vec_str(&[
+        "powershell",
+        "-Command",
+        "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+         $diagnostic.UseShellExecute = $false\n\
+         $diagnostic.Arguments = 'https://example.com'\n\
+         Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+    ]);
+    assert_eq!(
+        commands_for_exec_policy_for_platform(&command, DangerousCommandPlatform::Windows)
+            .command_origin,
+        ExecPolicyCommandOrigin::Generic
+    );
+    for (policy_src, approval_policy) in [
+        (None, AskForApproval::Never),
+        (
+            Some(r#"prefix_rule(pattern=["powershell"], decision="forbidden")"#),
+            AskForApproval::Never,
+        ),
+        (
+            Some(r#"prefix_rule(pattern=["powershell"], decision="prompt")"#),
+            AskForApproval::Never,
+        ),
+        (
+            Some(r#"prefix_rule(pattern=["powershell"], decision="prompt")"#),
+            AskForApproval::OnRequest,
+        ),
+    ] {
+        let policy = ExecPolicyManager::new(policy_from_src(policy_src));
+        let requirement = policy
+            .create_exec_approval_requirement_for_command_platform(
+                ExecApprovalRequest {
+                    command: &command,
+                    approval_policy,
+                    permission_profile: PermissionProfile::Disabled,
+                    environment_policy: None,
+                    windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+                    sandbox_permissions: SandboxPermissions::UseDefault,
+                    prefix_rule: None,
+                    allow_prefix_rules: AllowPrefixRules::Honor,
+                },
+                DangerousCommandPlatform::Windows,
+            )
+            .await;
+        if policy_src.is_none() {
+            assert_eq!(
+                requirement,
+                ExecApprovalRequirement::Skip {
+                    bypass_sandbox: false,
+                    proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(command.clone())),
+                }
+            );
+        } else if approval_policy == AskForApproval::Never {
+            assert!(matches!(
+                requirement,
+                ExecApprovalRequirement::Forbidden { .. }
+            ));
+        } else {
+            assert!(matches!(
+                requirement,
+                ExecApprovalRequirement::NeedsApproval { .. }
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn windows_process_start_with_false_assignment_still_requires_approval() {
+    let command = vec_str(&[
+        "powershell",
+        "-Command",
+        "$p.UseShellExecute=$false; $p.FileName='https://example.com'; [Diagnostics.Process]::Start($p)",
+    ]);
+    let policy = ExecPolicyManager::new(Arc::new(Policy::empty()));
+    for approval_policy in [AskForApproval::Never, AskForApproval::OnRequest] {
+        let requirement = policy
+            .create_exec_approval_requirement_for_command_platform(
+                ExecApprovalRequest {
+                    command: &command,
+                    approval_policy,
+                    permission_profile: PermissionProfile::Disabled,
+                    environment_policy: None,
+                    windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+                    sandbox_permissions: SandboxPermissions::UseDefault,
+                    prefix_rule: None,
+                    allow_prefix_rules: AllowPrefixRules::Honor,
+                },
+                DangerousCommandPlatform::Windows,
+            )
+            .await;
+        match approval_policy {
+            AskForApproval::Never => {
+                assert!(matches!(
+                    requirement,
+                    ExecApprovalRequirement::Forbidden { .. }
+                ));
+            }
+            AskForApproval::OnRequest => {
+                assert!(matches!(
+                    requirement,
+                    ExecApprovalRequirement::NeedsApproval { .. }
+                ));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
 async fn forced_rm_requires_approval_or_specific_rejection_on_all_platforms() {
     let policy = ExecPolicyManager::new(Arc::new(Policy::empty()));
     let permissions = SandboxPermissions::UseDefault;

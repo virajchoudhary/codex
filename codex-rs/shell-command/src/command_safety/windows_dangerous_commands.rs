@@ -1,6 +1,8 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use shlex::split as shlex_split;
+use tree_sitter::Node;
+use tree_sitter::Parser;
 use url::Url;
 
 pub fn is_dangerous_command_windows(command: &[String]) -> bool {
@@ -369,6 +371,105 @@ struct ParsedPowershell {
     tokens: Vec<String>,
 }
 
+fn powershell_script_words(script: &str) -> Option<Vec<String>> {
+    let words = shlex_split(script)?;
+    if !args_have_url(&words)
+        || !words
+            .iter()
+            .any(|word| word.to_ascii_lowercase().contains("useshellexecute"))
+    {
+        return Some(words);
+    }
+
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_powershell::LANGUAGE.into())
+        .is_err()
+    {
+        return Some(words);
+    }
+    let Some(tree) = parser.parse(script, None) else {
+        return Some(words);
+    };
+    if tree.root_node().has_error() {
+        return Some(words);
+    }
+
+    // Exclude only a proven literal-false property assignment from the substring
+    // heuristic. Keep every other marker, and retain the old check for actual
+    // Start() calls or dynamic method names whose launch behavior is unknown.
+    let source = script.as_bytes();
+    let mut sanitized = source.to_vec();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        if node.kind() == "invokation_expression"
+            && let Some(member) = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "member_name")
+            && (member
+                .named_child(0)
+                .is_none_or(|name| name.kind() != "simple_name")
+                || member
+                    .utf8_text(source)
+                    .is_ok_and(|name| name.eq_ignore_ascii_case("start")))
+        {
+            return Some(words);
+        }
+        if let Some(member) = literal_false_shell_execute_member(node, source) {
+            sanitized[member.byte_range()].fill(b'_');
+        }
+        stack.extend(node.named_children(&mut cursor));
+    }
+
+    std::str::from_utf8(&sanitized)
+        .ok()
+        .and_then(shlex_split)
+        .or(Some(words))
+}
+
+fn literal_false_shell_execute_member<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+) -> Option<Node<'tree>> {
+    if node.kind() != "assignment_expression" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let mut children = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment");
+    let mut left = children.next()?;
+    let operator = children.next()?;
+    let value = children.next()?;
+    if left.kind() != "left_assignment_expression"
+        || operator.kind() != "assignement_operator"
+        || operator.utf8_text(source).ok()? != "="
+        || children.next().is_some()
+        || !value.utf8_text(source).ok()?.eq_ignore_ascii_case("$false")
+    {
+        return None;
+    }
+    while left.kind() != "member_access" && left.named_child_count() == 1 {
+        left = left.named_child(0)?;
+    }
+    if left.kind() != "member_access"
+        || left.named_child_count() != 2
+        || left.named_child(0)?.kind() != "variable"
+        || left.child(1)?.kind() != "."
+    {
+        return None;
+    }
+    let member = left.named_child(1)?;
+    (member.kind() == "member_name"
+        && member.named_child(0)?.kind() == "simple_name"
+        && member
+            .utf8_text(source)
+            .ok()?
+            .eq_ignore_ascii_case("UseShellExecute"))
+    .then_some(member)
+}
+
 fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell> {
     if args.is_empty() {
         return None;
@@ -384,7 +485,7 @@ fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell> {
                 if idx + 2 != args.len() {
                     return None;
                 }
-                let tokens = shlex_split(script)?;
+                let tokens = powershell_script_words(script)?;
                 return Some(ParsedPowershell { tokens });
             }
             _ if lower.starts_with("-command:") || lower.starts_with("/command:") => {
@@ -392,7 +493,7 @@ fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell> {
                     return None;
                 }
                 let (_, script) = arg.split_once(':')?;
-                let tokens = shlex_split(script)?;
+                let tokens = powershell_script_words(script)?;
                 return Some(ParsedPowershell { tokens });
             }
             "-nologo" | "-noprofile" | "-noninteractive" | "-mta" | "-sta" => {
@@ -417,6 +518,113 @@ mod tests {
 
     fn vec_str(items: &[&str]) -> Vec<String> {
         items.iter().map(std::string::ToString::to_string).collect()
+    }
+
+    #[test]
+    fn powershell_unused_url_with_use_shell_execute_false_is_not_dangerous() {
+        let script = r"
+$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()
+$diagnostic.UseShellExecute = $false
+$diagnostic.Arguments = 'https://example.com'
+Write-Output 'Diagnostic only: no process was started and no network request was made.'
+";
+        assert!(!is_dangerous_command_windows(&vec_str(&[
+            "powershell",
+            "-Command",
+            script,
+        ])));
+    }
+
+    #[test]
+    fn powershell_literal_false_assignments_are_not_url_launches() {
+        for script in [
+            "$p.UseShellExecute=$false; $url='https://example.com'",
+            "$p.uSeShElLeXeCuTe = $FaLsE; $url='HTTPS://example.com'",
+            "${p}.UseShellExecute = $false; $url='https://example.com'",
+            "if ($true) { $p.UseShellExecute = $false }; $url='https://example.com'",
+            "$p.UseShellExecute = $false; $q.UseShellExecute = $false; $url='https://example.com'",
+            "$p.UseShellExecute = $false # disabled\n$url='https://example.com'",
+        ] {
+            assert!(
+                !is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", script])),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_false_assignment_controls_are_not_dangerous() {
+        for script in [
+            "$p.UseShellExecute = $false; $p.Arguments = 'example.txt'",
+            "$url = 'https://example.com'; Write-Output $url",
+        ] {
+            assert!(
+                !is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", script])),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_ambiguous_shell_execute_assignments_remain_dangerous() {
+        for script in [
+            "$p.UseShellExecute = $true; $url='https://example.com'",
+            "$p.UseShellExecute = $enabled; $url='https://example.com'",
+            "$p.UseShellExecute = '$false'; $url='https://example.com'",
+            "$p.UseShellExecute = ($false); $url='https://example.com'",
+            "$p.UseShellExecute = $false -or $true; $url='https://example.com'",
+            "$p.UseShellExecute += $false; $url='https://example.com'",
+            "$p.UseShellExecute = $false; $p.UseShellExecute = $true; $url='https://example.com'",
+            "$p.'UseShellExecute' = $false; $url='https://example.com'",
+            "$p.Info.UseShellExecute = $false; $url='https://example.com'",
+            "& '$p.UseShellExecute' '=' '$false' 'https://example.com'",
+            "$p.UseShellExecute = $false; $url='https://example.com'; if (",
+        ] {
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", script])),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_launches_and_deletion_with_false_assignment_remain_dangerous() {
+        for script in [
+            "$p.UseShellExecute=$false; Start-Process 'https://example.com'",
+            "$p.UseShellExecute=$false; saps 'https://example.com'",
+            "$p.UseShellExecute=$false; Invoke-Item 'https://example.com'",
+            "$p.UseShellExecute=$false; $shell.ShellExecute('https://example.com')",
+            "$p.UseShellExecute=$false; $shell=New-Object -ComObject Shell.Application; $url='https://example.com'",
+            "$p.UseShellExecute=$false; $p.FileName='https://example.com'; [Diagnostics.Process]::Start($p)",
+            "$p.UseShellExecute=$false; $p.Arguments='https://example.com'; $process.Start()",
+            "$p.UseShellExecute=$false; $url='https://example.com'; $process.$method()",
+            "$p.UseShellExecute=$false; $url='https://example.com'; $process.'Start'()",
+            "$p.UseShellExecute=$false; $url='https://example.com'; Remove-Item test -Force",
+        ] {
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", script])),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_false_assignment_command_flag_forms() {
+        let script = "$p.UseShellExecute=$false; $url='https://example.com'";
+        for command in [
+            vec_str(&["pwsh.exe", "-NoProfile", "-c", script]),
+            vec_str(&["powershell.exe", "/Command", script]),
+            vec_str(&["pwsh", &format!("-Command:{script}")]),
+            vec_str(&["powershell", &format!("/Command:{script}")]),
+        ] {
+            assert!(!is_dangerous_command_windows(&command), "{command:?}");
+        }
+        assert!(super::is_dangerous_powershell_words(&vec_str(&[
+            "$p.UseShellExecute",
+            "=",
+            "$false",
+            "https://example.com",
+        ])));
     }
 
     #[test]
