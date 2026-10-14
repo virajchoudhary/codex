@@ -1110,17 +1110,328 @@ async fn thread_resume_preserves_persisted_approvals_reviewer() -> Result<()> {
 async fn thread_resume_restores_persisted_approval_policy() -> Result<()> {
     assert_thread_resume_approval_policy(
         ThreadHistoryMode::Legacy,
-        /*approval_policy*/ None,
+        ThreadResumeParams::default(),
         AskForApproval::Never,
     )
     .await
+}
+
+#[test_case(ThreadHistoryMode::Legacy; "legacy history")]
+#[test_case(ThreadHistoryMode::Paginated; "paginated history")]
+#[tokio::test]
+async fn loaded_resume_legacy_sandbox_ignores_unrelated_profile_fallback(
+    history_mode: ThreadHistoryMode,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri())
+        .with_root_config("default_permissions = \":read-only\"")
+        .write(codex_home.path())?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        "default_permissions = \":read-only\"\n[allowed_permission_profiles]\n\":read-only\" = true",
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let started = mcp
+        .start_thread(ThreadStartParams {
+            history_mode: Some(history_mode),
+            ..Default::default()
+        })
+        .await?;
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: started.thread.id.clone(),
+        input: vec![UserInput::Text {
+            text: "materialize this thread".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    mock_responses_config(&server.uri())
+        .with_approval_policy("on-request")
+        .with_root_config("default_permissions = \":danger-full-access\"")
+        .write(codex_home.path())?;
+    let request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: started.thread.id.clone(),
+            exclude_turns: true,
+            sandbox: Some(SandboxMode::ReadOnly),
+            approval_policy: Some(AskForApproval::OnRequest),
+            ..Default::default()
+        })
+        .await?;
+    let resumed: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(resumed.approval_policy, AskForApproval::OnRequest);
+    assert!(matches!(resumed.sandbox, AppSandboxPolicy::ReadOnly { .. }));
+    assert_eq!(resumed.active_permission_profile, None);
+    for params in [
+        ThreadResumeParams {
+            permissions: Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string()),
+            ..Default::default()
+        },
+        ThreadResumeParams {
+            sandbox: Some(SandboxMode::DangerFullAccess),
+            ..Default::default()
+        },
+    ] {
+        let request_id = mcp
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: started.thread.id.clone(),
+                exclude_turns: true,
+                ..params
+            })
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+    }
+    let request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: started.thread.id,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let unchanged: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(unchanged.approval_policy, resumed.approval_policy);
+    assert_eq!(unchanged.sandbox, resumed.sandbox);
+    assert_eq!(
+        unchanged.active_permission_profile,
+        resumed.active_permission_profile
+    );
+    Ok(())
+}
+
+#[test_case(ThreadHistoryMode::Legacy; "legacy history")]
+#[test_case(ThreadHistoryMode::Paginated; "paginated history")]
+#[tokio::test]
+async fn loaded_resume_rejects_unknown_permission_profile(
+    history_mode: ThreadHistoryMode,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    write_dev_permission_config(&server.uri(), codex_home.path(), ":read-only")?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let started = mcp
+        .start_thread(ThreadStartParams {
+            history_mode: Some(history_mode),
+            ..Default::default()
+        })
+        .await?;
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: started.thread.id.clone(),
+        input: vec![UserInput::Text {
+            text: "materialize this thread".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    let request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: started.thread.id.clone(),
+            exclude_turns: true,
+            permissions: Some("missing-permission-profile".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert!(
+        response
+            .error
+            .message
+            .contains("missing-permission-profile")
+    );
+    let request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: started.thread.id,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let unchanged: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(unchanged.approval_policy, started.approval_policy);
+    assert_eq!(unchanged.sandbox, started.sandbox);
+    assert_eq!(
+        unchanged.active_permission_profile,
+        started.active_permission_profile
+    );
+    Ok(())
+}
+
+#[test_case(ThreadHistoryMode::Legacy; "legacy history")]
+#[test_case(ThreadHistoryMode::Paginated; "paginated history")]
+#[tokio::test]
+async fn loaded_resume_applies_and_persists_permission_overrides(
+    history_mode: ThreadHistoryMode,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let started = mcp
+        .start_thread(ThreadStartParams {
+            history_mode: Some(history_mode),
+            permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
+            approval_policy: Some(AskForApproval::OnRequest),
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(started.approvals_reviewer, ApprovalsReviewer::AutoReview);
+    let thread_id = started.thread.id;
+    let saved_rollout = started.thread.path.expect("thread rollout path");
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: thread_id.clone(),
+        input: vec![UserInput::Text {
+            text: "materialize this thread".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    mcp.clear_message_buffer();
+
+    let request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            exclude_turns: true,
+            approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            permissions: Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let resumed: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(resumed.thread.id, thread_id);
+    assert_eq!(resumed.approval_policy, AskForApproval::Never);
+    assert_eq!(resumed.approvals_reviewer, ApprovalsReviewer::User);
+    assert_eq!(resumed.sandbox, AppSandboxPolicy::DangerFullAccess);
+    assert_eq!(
+        resumed.active_permission_profile.map(|profile| profile.id),
+        Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string())
+    );
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+    let updated: codex_app_server_protocol::ThreadSettingsUpdatedNotification =
+        serde_json::from_value(notification.params.expect("settings notification params"))?;
+    assert_eq!(updated.thread_id, thread_id);
+    assert_eq!(
+        updated.thread_settings.approval_policy,
+        AskForApproval::Never
+    );
+    assert_eq!(
+        updated.thread_settings.sandbox_policy,
+        AppSandboxPolicy::DangerFullAccess
+    );
+    assert_eq!(
+        updated.thread_settings.approvals_reviewer,
+        ApprovalsReviewer::User
+    );
+    mcp.shutdown_gracefully().await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let restored: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(restored.thread.id, thread_id);
+    assert_eq!(restored.approval_policy, AskForApproval::Never);
+    assert_eq!(restored.approvals_reviewer, ApprovalsReviewer::User);
+    assert_eq!(restored.sandbox, AppSandboxPolicy::DangerFullAccess);
+    assert_eq!(
+        restored.active_permission_profile.map(|profile| profile.id),
+        Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string())
+    );
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: thread_id.clone(),
+        input: vec![UserInput::Text {
+            text: "continue with accepted permissions".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    let request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            exclude_turns: true,
+            sandbox: Some(SandboxMode::ReadOnly),
+            approval_policy: Some(AskForApproval::OnRequest),
+            ..Default::default()
+        })
+        .await?;
+    let legacy: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(legacy.approval_policy, AskForApproval::OnRequest);
+    assert!(matches!(legacy.sandbox, AppSandboxPolicy::ReadOnly { .. }));
+    assert_eq!(legacy.active_permission_profile, None);
+    mcp.shutdown_gracefully().await?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&saved_rollout).await?;
+    let context = items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::TurnContext(context) => Some(context),
+            _ => None,
+        })
+        .expect("completed turn context");
+    assert_eq!(
+        context.approval_policy,
+        codex_protocol::protocol::AskForApproval::Never
+    );
+    assert_eq!(
+        context.approvals_reviewer,
+        Some(codex_protocol::config_types::ApprovalsReviewer::User)
+    );
+    assert_eq!(
+        context.sandbox_policy,
+        codex_protocol::protocol::SandboxPolicy::DangerFullAccess
+    );
+    assert_eq!(
+        context
+            .active_permission_profile
+            .as_ref()
+            .map(|profile| profile.id.as_str()),
+        Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS)
+    );
+    Ok(())
 }
 
 #[tokio::test]
 async fn paginated_thread_resume_restores_persisted_approval_policy() -> Result<()> {
     assert_thread_resume_approval_policy(
         ThreadHistoryMode::Paginated,
-        /*approval_policy*/ None,
+        ThreadResumeParams::default(),
         AskForApproval::Never,
     )
     .await
@@ -1130,7 +1441,30 @@ async fn paginated_thread_resume_restores_persisted_approval_policy() -> Result<
 async fn thread_resume_approval_policy_override_wins_over_persisted_policy() -> Result<()> {
     assert_thread_resume_approval_policy(
         ThreadHistoryMode::Legacy,
-        Some(AskForApproval::OnRequest),
+        ThreadResumeParams {
+            approval_policy: Some(AskForApproval::OnRequest),
+            ..Default::default()
+        },
+        AskForApproval::OnRequest,
+    )
+    .await
+}
+
+#[test_case(ThreadHistoryMode::Legacy; "legacy history")]
+#[test_case(ThreadHistoryMode::Paginated; "paginated history")]
+#[tokio::test]
+async fn cold_resume_config_approval_policy_wins_over_persisted_policy(
+    history_mode: ThreadHistoryMode,
+) -> Result<()> {
+    assert_thread_resume_approval_policy(
+        history_mode,
+        ThreadResumeParams {
+            config: Some(std::collections::HashMap::from([(
+                "approval_policy".to_string(),
+                json!("on-request"),
+            )])),
+            ..Default::default()
+        },
         AskForApproval::OnRequest,
     )
     .await
@@ -1138,7 +1472,7 @@ async fn thread_resume_approval_policy_override_wins_over_persisted_policy() -> 
 
 async fn assert_thread_resume_approval_policy(
     history_mode: ThreadHistoryMode,
-    approval_policy: Option<AskForApproval>,
+    params: ThreadResumeParams,
     expected_approval_policy: AskForApproval,
 ) -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
@@ -1222,8 +1556,7 @@ stream_max_retries = 0
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id,
-            approval_policy,
-            ..Default::default()
+            ..params
         })
         .await?;
     let ThreadResumeResponse {
@@ -5363,6 +5696,8 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
             thread_id: thread.id.clone(),
             model: Some("not-the-running-model".to_string()),
             cwd: Some("/tmp".to_string()),
+            permissions: Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string()),
+            approval_policy: Some(AskForApproval::Never),
             initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
                 limit: Some(1),
                 sort_direction: Some(SortDirection::Desc),
@@ -5374,10 +5709,17 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
     let ThreadResumeResponse {
         thread,
         model,
+        sandbox,
+        active_permission_profile,
         initial_turns_page,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, primary.read_response(resume_id)).await??;
     assert_eq!(model, "gpt-5.4");
+    assert_eq!(sandbox, AppSandboxPolicy::DangerFullAccess);
+    assert_eq!(
+        active_permission_profile.map(|profile| profile.id),
+        Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string())
+    );
     let initial_turns_page = initial_turns_page.expect("resume should include initial turns page");
     assert_eq!(initial_turns_page.data.len(), 1);
     let resumed_running_turn = initial_turns_page
@@ -5499,6 +5841,25 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
         primary.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    primary.shutdown_gracefully().await?;
+    let (items, _, _) =
+        RolloutRecorder::load_rollout_items(thread.path.as_ref().expect("thread rollout path"))
+            .await?;
+    let running_context = items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::TurnContext(context)
+                if context.turn_id.as_deref() == Some(running_turn.id.as_str()) =>
+            {
+                Some(context)
+            }
+            _ => None,
+        })
+        .expect("in-flight turn context");
+    assert!(matches!(
+        running_context.sandbox_policy,
+        codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
+    ));
     server.shutdown().await;
 
     Ok(())

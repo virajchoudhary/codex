@@ -402,6 +402,30 @@ async fn thread_fork_preserves_persisted_permission_profile_and_honors_overrides
         assert_eq!(approval_policy, AskForApproval::Never);
         assert_eq!(active_permission_profile, None);
 
+        for (approval_policy, expected) in [
+            (None, AskForApproval::Never),
+            (Some(AskForApproval::OnRequest), AskForApproval::OnRequest),
+        ] {
+            let fork_id = mcp
+                .send_thread_fork_request(ThreadForkParams {
+                    thread_id: source_thread_id.clone(),
+                    approval_policy,
+                    config: Some(std::collections::HashMap::from([(
+                        "approval_policy".to_string(),
+                        json!("never"),
+                    )])),
+                    ..Default::default()
+                })
+                .await?;
+            let forked: ThreadForkResponse =
+                timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+            assert_eq!(forked.approval_policy, expected);
+            assert_eq!(
+                forked.active_permission_profile.map(|profile| profile.id),
+                Some("dev".to_string())
+            );
+        }
+
         let fork_id = mcp
             .send_thread_fork_request(ThreadForkParams {
                 thread_id: source_thread_id,
