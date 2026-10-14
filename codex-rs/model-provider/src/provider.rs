@@ -816,6 +816,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn custom_provider_without_openai_auth_does_not_retain_ambient_auth_manager() {
+        let ambient =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let provider = create_model_provider(
+            ModelProviderInfo {
+                name: "Synthetic Azure".to_string(),
+                base_url: Some("http://localhost:12345/openai".to_string()),
+                env_key: Some("SYNTHETIC_AZURE_KEY".to_string()),
+                requires_openai_auth: false,
+                ..ModelProviderInfo::default()
+            },
+            Some(ambient),
+        );
+
+        assert!(
+            provider.auth_manager().is_none(),
+            "custom API-key providers must not refresh or recover unrelated ChatGPT auth"
+        );
+        assert!(provider.auth().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn custom_provider_keeps_explicit_bearer_without_ambient_account_headers() {
+        let provider = create_model_provider(
+            ModelProviderInfo {
+                name: "Synthetic Azure".to_string(),
+                base_url: Some("http://localhost:12345/openai".to_string()),
+                experimental_bearer_token: Some("synthetic-provider-token".to_string().into()),
+                requires_openai_auth: false,
+                ..ModelProviderInfo::default()
+            },
+            Some(AuthManager::from_auth_for_testing(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            )),
+        );
+        let headers = provider
+            .api_auth()
+            .await
+            .expect("provider auth")
+            .to_auth_headers();
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers.get(http::header::AUTHORIZATION),
+            Some(&http::HeaderValue::from_static(
+                "Bearer synthetic-provider-token"
+            )),
+        );
+    }
+
+    #[test]
+    fn custom_provider_review_model_does_not_depend_on_ambient_login() {
+        for ambient in [
+            None,
+            Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "synthetic-account-key",
+            ))),
+            Some(AuthManager::from_auth_for_testing(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            )),
+        ] {
+            let provider = create_model_provider(
+                ModelProviderInfo {
+                    name: "Synthetic Azure".to_string(),
+                    base_url: Some("http://localhost:12345/openai".to_string()),
+                    experimental_bearer_token: Some("synthetic-provider-token".to_string().into()),
+                    requires_openai_auth: false,
+                    ..ModelProviderInfo::default()
+                },
+                ambient,
+            );
+
+            assert_eq!(
+                provider.approval_review_preferred_model(),
+                DEFAULT_APPROVAL_REVIEW_PREFERRED_MODEL,
+                "custom-provider review preference must not depend on a personal login",
+            );
+        }
+    }
+
+    #[test]
+    fn provider_requiring_openai_auth_retains_ambient_auth_manager() {
+        let ambient =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let provider = create_model_provider(
+            ModelProviderInfo {
+                name: "Explicit account auth".to_string(),
+                base_url: Some("http://localhost:12345/v1".to_string()),
+                requires_openai_auth: true,
+                ..ModelProviderInfo::default()
+            },
+            Some(Arc::clone(&ambient)),
+        );
+
+        assert!(Arc::ptr_eq(
+            &provider
+                .auth_manager()
+                .expect("explicit OpenAI auth manager"),
+            &ambient,
+        ));
+    }
+
     #[test]
     fn create_model_provider_builds_command_auth_manager_without_base_manager() {
         let provider = create_model_provider(
@@ -828,6 +931,23 @@ mod tests {
             .expect("command auth provider should have an auth manager");
 
         assert!(auth_manager.has_external_auth());
+    }
+
+    #[test]
+    fn custom_command_auth_does_not_retain_ambient_auth_manager() {
+        let ambient =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let provider = create_model_provider(
+            provider_info_with_command_auth(),
+            Some(Arc::clone(&ambient)),
+        );
+
+        assert!(!Arc::ptr_eq(
+            &provider
+                .auth_manager()
+                .expect("provider command auth manager"),
+            &ambient,
+        ));
     }
 
     #[test]
