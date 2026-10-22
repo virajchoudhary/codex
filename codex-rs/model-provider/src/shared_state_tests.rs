@@ -176,6 +176,73 @@ async fn gateway_credentials_accompany_primary_auth_in_models_and_responses() {
 }
 
 #[tokio::test]
+async fn custom_explicit_bearer_with_gateway_oauth_composes_for_scoped_auth() {
+    let home = tempfile::tempdir().unwrap();
+    let primary = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        home.path().to_path_buf(),
+    );
+    let info = ModelProviderInfo {
+        name: "Synthetic Azure".to_string(),
+        base_url: Some("https://api.synthetic.invalid/v1".to_string()),
+        experimental_bearer_token: Some("synthetic-provider-token".to_string().into()),
+        gateway_oauth: Some(GatewayOAuthConfig {
+            authorization_url: "https://issuer.synthetic.invalid/authorize".to_string(),
+            token_url: "https://issuer.synthetic.invalid/token".to_string(),
+            client_id: "synthetic-client".into(),
+            resource: None,
+            scopes: vec![],
+            redirect_port: None,
+            delivery: GatewayOAuthDelivery::Header {
+                name: "x-gateway-auth".into(),
+                scheme: "Bearer".into(),
+            },
+        }),
+        requires_openai_auth: false,
+        ..ModelProviderInfo::default()
+    };
+    let _gateway = seed_gateway_auth(
+        &info,
+        &primary,
+        json!({
+            "access_token": "synthetic-gateway-token",
+            "refresh_token": "synthetic-refresh-token",
+            "expires_at": i64::MAX
+        }),
+    );
+    let provider = create_model_provider(info, Some(primary));
+
+    assert!(
+        provider.auth_manager().is_none(),
+        "custom provider must not retain ambient account auth"
+    );
+    let scoped = provider
+        .api_auth_for_scope(ProviderAuthScope {
+            agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
+            session_source: SessionSource::Cli,
+            agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+        })
+        .await
+        .unwrap();
+    let expected = HeaderMap::from_iter([
+        (
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer synthetic-provider-token"),
+        ),
+        (
+            HeaderName::from_static("x-gateway-auth"),
+            HeaderValue::from_static("Bearer synthetic-gateway-token"),
+        ),
+    ]);
+
+    assert_eq!(scoped.auth.to_auth_headers().unwrap(), expected);
+    let resolved = scoped.auth.resolve_auth_headers().await.unwrap();
+    assert_eq!(resolved, expected);
+    assert_eq!(resolved.len(), 2);
+    assert!(!resolved.contains_key("chatgpt-account-id"));
+}
+
+#[tokio::test]
 async fn gateway_refresh_preserves_primary_auth_and_hides_issuer_errors() {
     for succeeds in [true, false] {
         let server = MockServer::start().await;
