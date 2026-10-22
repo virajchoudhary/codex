@@ -22,7 +22,7 @@ jobs:
       - name: "Prepare bounded D: task root"
         shell: pwsh
         run: |
-          $taskRoot = Join-Path $env:RUNNER_TEMP "codex-contribution-verification-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
+          $taskRoot = Join-Path $env:RUNNER_TEMP "cx-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
           python -B .github/scripts/run_contribution_verification.py --prepare-environment --task-root $taskRoot
 
       - name: Run verifier lifecycle self-tests
@@ -46,7 +46,7 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: contribution-verification-windows-${{ github.sha }}
-          path: ${{ runner.temp }}/codex-contribution-verification-${{ github.run_id }}-${{ github.run_attempt }}/evidence
+          path: ${{ runner.temp }}/cx-${{ github.run_id }}-${{ github.run_attempt }}/evidence
           if-no-files-found: warn
           retention-days: 7
 
