@@ -2,6 +2,8 @@ use crate::command_safety::powershell_tree_sitter::try_parse_powershell_commands
 use once_cell::sync::Lazy;
 use regex::Regex;
 use shlex::split as shlex_split;
+use tree_sitter::Node;
+use tree_sitter::Parser;
 use url::Url;
 
 pub fn is_dangerous_command_windows(command: &[String]) -> bool {
@@ -438,10 +440,409 @@ struct ParsedPowershell<'a> {
     script: Option<&'a str>,
 }
 
+fn powershell_script_words(script: &str, allow_inert_diagnostic: bool) -> Option<Vec<String>> {
+    let words = shlex_split(script)?;
+    if !allow_inert_diagnostic
+        || !args_have_url(&words)
+        || !words
+            .iter()
+            .any(|word| word.to_ascii_lowercase().contains("useshellexecute"))
+    {
+        return Some(words);
+    }
+
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_powershell::LANGUAGE.into())
+        .is_err()
+    {
+        return Some(words);
+    }
+    let Some(tree) = parser.parse(script, None) else {
+        return Some(words);
+    };
+    let source = script.as_bytes();
+    let root = tree.root_node();
+    if root.has_error() || !is_inert_process_start_info_diagnostic(root, source) {
+        return Some(words);
+    }
+
+    let mut sanitized = source.to_vec();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        if let Some(member) = literal_false_shell_execute_member(node, source)
+            .or_else(|| direct_shell_execute_read_member(node, source).map(|(_, member)| member))
+        {
+            sanitized[member.byte_range()].fill(b'_');
+        }
+        stack.extend(node.named_children(&mut cursor));
+    }
+
+    std::str::from_utf8(&sanitized)
+        .ok()
+        .and_then(shlex_split)
+        .or(Some(words))
+}
+
+fn is_inert_process_start_info_diagnostic(root: Node<'_>, source: &[u8]) -> bool {
+    if root.kind() != "program"
+        || root.named_child_count() != 1
+        || root
+            .named_child(0)
+            .is_none_or(|node| node.kind() != "statement_list")
+    {
+        return false;
+    }
+    let Some(statement_list) = root.named_child(0) else {
+        return false;
+    };
+    let mut statement_cursor = statement_list.walk();
+    let statements: Vec<_> = statement_list
+        .named_children(&mut statement_cursor)
+        .collect();
+    if statements.len() != 4
+        || statements[..3].iter().any(|statement| {
+            statement.kind() != "pipeline"
+                || statement.named_child_count() != 1
+                || statement
+                    .named_child(0)
+                    .is_none_or(|expression| expression.kind() != "assignment_expression")
+        })
+    {
+        return false;
+    }
+    let Some((shell_execute_read_variable, _)) =
+        direct_shell_execute_read_member(statements[3], source)
+    else {
+        return false;
+    };
+
+    let mut diagnostic_variable = None;
+    let mut shell_execute_variable = None;
+    let mut arguments_variable = None;
+    let mut constructor_offset = None;
+    let mut shell_execute_offset = None;
+    let mut arguments_offset = None;
+    let mut assignment_count = 0;
+    let mut invocation_count = 0;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !is_inert_diagnostic_node_kind(node.kind()) {
+            return false;
+        }
+
+        match node.kind() {
+            "assignment_expression" => {
+                assignment_count += 1;
+                if let Some(variable) = process_start_info_constructor_variable(node, source) {
+                    if diagnostic_variable.replace(variable).is_some() {
+                        return false;
+                    }
+                    constructor_offset = Some(node.start_byte());
+                } else if let Some(variable) = literal_false_shell_execute_variable(node, source) {
+                    if shell_execute_variable.replace(variable).is_some() {
+                        return false;
+                    }
+                    shell_execute_offset = Some(node.start_byte());
+                } else if let Some(variable) = literal_url_arguments_variable(node, source) {
+                    if arguments_variable.replace(variable).is_some() {
+                        return false;
+                    }
+                    arguments_offset = Some(node.start_byte());
+                } else {
+                    return false;
+                }
+            }
+            "invokation_expression" => {
+                invocation_count += 1;
+                if !is_process_start_info_constructor_invocation(node, source) {
+                    return false;
+                }
+            }
+            "comment"
+                if node.utf8_text(source).ok().is_some_and(|comment| {
+                    comment
+                        .trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("#requires")
+                }) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+
+    let (Some(diagnostic_variable), Some(shell_execute_variable), Some(arguments_variable)) = (
+        diagnostic_variable,
+        shell_execute_variable,
+        arguments_variable,
+    ) else {
+        return false;
+    };
+    let (Some(constructor_offset), Some(shell_execute_offset), Some(arguments_offset)) =
+        (constructor_offset, shell_execute_offset, arguments_offset)
+    else {
+        return false;
+    };
+    let read_offset = statements[3].start_byte();
+
+    assignment_count == 3
+        && invocation_count == 1
+        && diagnostic_variable.eq_ignore_ascii_case(&shell_execute_variable)
+        && diagnostic_variable.eq_ignore_ascii_case(&arguments_variable)
+        && diagnostic_variable.eq_ignore_ascii_case(&shell_execute_read_variable)
+        && constructor_offset < shell_execute_offset
+        && shell_execute_offset < arguments_offset
+        && arguments_offset < read_offset
+}
+
+fn is_inert_diagnostic_node_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "program"
+            | "statement_list"
+            | "pipeline"
+            | "pipeline_chain"
+            | "empty_statement"
+            | "comment"
+            | "assignment_expression"
+            | "left_assignment_expression"
+            | "assignement_operator"
+            | "logical_expression"
+            | "bitwise_expression"
+            | "comparison_expression"
+            | "additive_expression"
+            | "multiplicative_expression"
+            | "format_expression"
+            | "range_expression"
+            | "array_literal_expression"
+            | "unary_expression"
+            | "variable"
+            | "member_access"
+            | "member_name"
+            | "simple_name"
+            | "invokation_expression"
+            | "type_literal"
+            | "type_name"
+            | "type_spec"
+            | "type_identifier"
+            | "argument_list"
+            | "string_literal"
+            | "verbatim_string_characters"
+    )
+}
+
+fn direct_shell_execute_read_member<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+) -> Option<(String, Node<'tree>)> {
+    if node.kind() != "pipeline" || node.named_child_count() != 1 {
+        return None;
+    }
+    let pipeline_chain = node.named_child(0)?;
+    if pipeline_chain.kind() != "pipeline_chain" || pipeline_chain.named_child_count() != 1 {
+        return None;
+    }
+
+    let mut expression = pipeline_chain.named_child(0)?;
+    while expression.kind() != "member_access" {
+        if !matches!(
+            expression.kind(),
+            "logical_expression"
+                | "bitwise_expression"
+                | "comparison_expression"
+                | "additive_expression"
+                | "multiplicative_expression"
+                | "format_expression"
+                | "range_expression"
+                | "array_literal_expression"
+                | "unary_expression"
+        ) || expression.named_child_count() != 1
+        {
+            return None;
+        }
+        expression = expression.named_child(0)?;
+    }
+
+    if expression.named_child_count() != 2 || expression.child(1)?.kind() != "." {
+        return None;
+    }
+    let receiver = simple_variable_text(expression.named_child(0)?, source)?;
+    let member = expression.named_child(1)?;
+    if member.kind() != "member_name"
+        || member.named_child_count() != 1
+        || member.named_child(0)?.kind() != "simple_name"
+        || !member
+            .utf8_text(source)
+            .ok()?
+            .eq_ignore_ascii_case("UseShellExecute")
+    {
+        return None;
+    }
+    Some((receiver, member))
+}
+
+fn assignment_parts<'tree>(node: Node<'tree>, source: &[u8]) -> Option<(Node<'tree>, Node<'tree>)> {
+    if node.kind() != "assignment_expression" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let mut children = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment");
+    let mut left = children.next()?;
+    let operator = children.next()?;
+    let value = children.next()?;
+    if left.kind() != "left_assignment_expression"
+        || operator.kind() != "assignement_operator"
+        || operator.utf8_text(source).ok()? != "="
+        || children.next().is_some()
+    {
+        return None;
+    }
+    while !matches!(left.kind(), "member_access" | "variable") && left.named_child_count() == 1 {
+        left = left.named_child(0)?;
+    }
+    Some((left, value))
+}
+
+fn assignment_member_target<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+) -> Option<(String, Node<'tree>, Node<'tree>)> {
+    let (target, value) = assignment_parts(node, source)?;
+    if target.kind() != "member_access"
+        || target.named_child_count() != 2
+        || target.child(1)?.kind() != "."
+    {
+        return None;
+    }
+    let receiver = simple_variable_text(target.named_child(0)?, source)?;
+    let member = target.named_child(1)?;
+    if member.kind() != "member_name" || member.named_child(0)?.kind() != "simple_name" {
+        return None;
+    }
+    Some((receiver, member, value))
+}
+
+fn simple_variable_text(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() != "variable" {
+        return None;
+    }
+    let text = node.utf8_text(source).ok()?;
+    let name = text.strip_prefix('$')?;
+    let mut characters = name.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        || !characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+fn process_start_info_constructor_variable(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let (target, value) = assignment_parts(node, source)?;
+    let variable = simple_variable_text(target, source)?;
+    let invocation = unwrap_single_named_node(value, "invokation_expression")?;
+    is_process_start_info_constructor_invocation(invocation, source).then_some(variable)
+}
+
+fn is_process_start_info_constructor_invocation(node: Node<'_>, source: &[u8]) -> bool {
+    if node.kind() != "invokation_expression" || node.named_child_count() != 3 {
+        return false;
+    }
+    let Some(type_literal) = node.named_child(0) else {
+        return false;
+    };
+    let Some(member) = node.named_child(1) else {
+        return false;
+    };
+    let Some(arguments) = node.named_child(2) else {
+        return false;
+    };
+    type_literal.kind() == "type_literal"
+        && node
+            .child(1)
+            .is_some_and(|operator| operator.kind() == "::")
+        && type_literal
+            .utf8_text(source)
+            .is_ok_and(|value| value.eq_ignore_ascii_case("[System.Diagnostics.ProcessStartInfo]"))
+        && member.kind() == "member_name"
+        && member
+            .utf8_text(source)
+            .is_ok_and(|value| value.eq_ignore_ascii_case("new"))
+        && member
+            .named_child(0)
+            .is_some_and(|name| name.kind() == "simple_name")
+        && arguments.kind() == "argument_list"
+        && arguments.named_child_count() == 0
+}
+
+fn literal_false_shell_execute_variable(node: Node<'_>, source: &[u8]) -> Option<String> {
+    literal_false_shell_execute_member(node, source)?;
+    assignment_member_target(node, source).map(|(receiver, _, _)| receiver)
+}
+
+fn literal_url_arguments_variable(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let (receiver, member, value) = assignment_member_target(node, source)?;
+    if !member
+        .utf8_text(source)
+        .ok()?
+        .eq_ignore_ascii_case("Arguments")
+    {
+        return None;
+    }
+    let literal = unwrap_single_named_node(value, "string_literal")?;
+    if literal.named_child_count() != 1
+        || literal.named_child(0)?.kind() != "verbatim_string_characters"
+    {
+        return None;
+    }
+    let words = shlex_split(literal.utf8_text(source).ok()?)?;
+    (words.len() == 1 && args_have_url(&words)).then_some(receiver)
+}
+
+fn unwrap_single_named_node<'tree>(
+    mut node: Node<'tree>,
+    expected_kind: &str,
+) -> Option<Node<'tree>> {
+    while node.kind() != expected_kind {
+        if node.named_child_count() != 1 {
+            return None;
+        }
+        node = node.named_child(0)?;
+    }
+    Some(node)
+}
+
+fn literal_false_shell_execute_member<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+) -> Option<Node<'tree>> {
+    let (_, member, value) = assignment_member_target(node, source)?;
+    if !member
+        .utf8_text(source)
+        .ok()?
+        .eq_ignore_ascii_case("UseShellExecute")
+        || !value.utf8_text(source).ok()?.eq_ignore_ascii_case("$false")
+    {
+        return None;
+    }
+    Some(member)
+}
+
 fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell<'_>> {
     if args.is_empty() {
         return None;
     }
+    let allow_inert_diagnostic = is_no_profile_command_envelope(args);
 
     let mut idx = 0;
     while idx < args.len() {
@@ -453,7 +854,7 @@ fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell<'_>> 
                 if idx + 2 != args.len() {
                     return None;
                 }
-                let tokens = shlex_split(script)?;
+                let tokens = powershell_script_words(script, allow_inert_diagnostic)?;
                 return Some(ParsedPowershell {
                     tokens,
                     script: Some(script),
@@ -464,7 +865,7 @@ fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell<'_>> 
                     return None;
                 }
                 let (_, script) = arg.split_once(':')?;
-                let tokens = shlex_split(script)?;
+                let tokens = powershell_script_words(script, allow_inert_diagnostic)?;
                 return Some(ParsedPowershell {
                     tokens,
                     script: Some(script),
@@ -487,6 +888,26 @@ fn parse_powershell_invocation(args: &[String]) -> Option<ParsedPowershell<'_>> 
     }
 
     None
+}
+
+fn is_no_profile_command_envelope(args: &[String]) -> bool {
+    let Some(command_index) = args.len().checked_sub(2) else {
+        return false;
+    };
+    let mut has_no_profile = false;
+    let mut has_non_interactive = false;
+    for arg in &args[..command_index] {
+        if arg.eq_ignore_ascii_case("-NoProfile") && !has_no_profile {
+            has_no_profile = true;
+        } else if arg.eq_ignore_ascii_case("-NonInteractive") && !has_non_interactive {
+            has_non_interactive = true;
+        } else {
+            return false;
+        }
+    }
+    has_no_profile
+        && (args[command_index].eq_ignore_ascii_case("-Command")
+            || args[command_index].eq_ignore_ascii_case("-c"))
 }
 
 #[cfg(test)]
@@ -536,6 +957,169 @@ mod tests {
             "-Command",
             "Start-Process notepad.exe"
         ])));
+    }
+
+    #[test]
+    fn powershell_no_profile_inert_diagnostic_with_direct_shell_execute_read_is_not_dangerous() {
+        let script = "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+            $diagnostic.UseShellExecute = $false\n\
+            $diagnostic.Arguments = 'https://example.com'\n\
+            $diagnostic.UseShellExecute";
+        for flags in [
+            &["-NonInteractive", "-NoProfile", "-Command"][..],
+            &["-NoProfile", "-c"][..],
+        ] {
+            let command = [vec_str(&["powershell"]), vec_str(flags), vec_str(&[script])].concat();
+            assert!(
+                !is_dangerous_command_windows(&command),
+                "{command:?} should be non-dangerous"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_diagnostic_requires_full_no_profile_and_no_commands() {
+        let assignments = "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+            $diagnostic.UseShellExecute = $false\n\
+            $diagnostic.Arguments = 'https://example.com'";
+        for (flags, final_statement) in [
+            (&["-Command"][..], "$diagnostic.UseShellExecute"),
+            (
+                &["-Command"][..],
+                "Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+            ),
+            (
+                &["-NoProfile", "-Command"][..],
+                "Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+            ),
+            (
+                &["-NoProfile", "-Command"][..],
+                "Microsoft.PowerShell.Utility\\Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+            ),
+            (
+                &["-NoP", "-Command"][..],
+                "Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+            ),
+        ] {
+            let script = format!("{assignments}\n{final_statement}");
+            let command = [vec_str(&["pwsh"]), vec_str(flags), vec_str(&[&script])].concat();
+            assert!(
+                is_dangerous_command_windows(&command),
+                "{command:?} should remain dangerous"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_no_profile_diagnostic_rejects_other_startup_options() {
+        let script = "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+            $diagnostic.UseShellExecute = $false\n\
+            $diagnostic.Arguments = 'https://example.com'\n\
+            $diagnostic.UseShellExecute";
+        for flags in [
+            &["-NoProfile", "-NoLogo", "-Command"][..],
+            &["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"][..],
+        ] {
+            let command = [vec_str(&["pwsh"]), vec_str(flags), vec_str(&[script])].concat();
+            assert!(
+                is_dangerous_command_windows(&command),
+                "{command:?} should remain dangerous"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_no_profile_diagnostic_rejects_dotted_constructor() {
+        let script = "$diagnostic = [System.Diagnostics.ProcessStartInfo].new()\n\
+            $diagnostic.UseShellExecute = $false\n\
+            $diagnostic.Arguments = 'https://example.com'\n\
+            $diagnostic.UseShellExecute";
+        assert!(is_dangerous_command_windows(&vec_str(&[
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            script,
+        ])));
+    }
+
+    #[test]
+    fn powershell_unused_url_diagnostic_with_dynamic_execution_remains_dangerous() {
+        let diagnostic = "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+            $diagnostic.UseShellExecute = $false\n\
+            $diagnostic.Arguments = 'https://example.com'\n\
+            Write-Output 'Diagnostic only: no process was started and no network request was made.'";
+        for suffix in [
+            "& ('Start-' + 'Process') 'https://example.com'",
+            ". $scriptPath 'https://example.com'",
+            "Set-Alias -Name go -Value ('Start-' + 'Process'); go 'https://example.com'",
+            "New-Alias -Name go -Value ('Start-' + 'Process'); go 'https://example.com'",
+            "Invoke-Expression ('Start-' + 'Process https://example.com')",
+            "iex ('Start-' + 'Process https://example.com')",
+        ] {
+            let script = format!("{diagnostic}\n{suffix}");
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", &script])),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_call_operator_after_false_assignment_remains_dangerous() {
+        let script = "$p.UseShellExecute = $false; $cmd = 'Start-' + 'Process'; & $cmd 'https://example.com'";
+        assert!(
+            is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", script])),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn powershell_dot_source_after_false_assignment_remains_dangerous() {
+        let script = "$p.UseShellExecute = $false; . $scriptPath 'https://example.com'";
+        assert!(
+            is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", script])),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn powershell_alias_rebinding_after_false_assignment_remains_dangerous() {
+        let script = "$p.UseShellExecute=$false; Set-Alias -Name go -Value ('Start-' + 'Process'); go 'https://example.com'";
+        assert!(
+            is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", script])),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn powershell_dynamic_expression_after_false_assignment_remains_dangerous() {
+        for command in ["Invoke-Expression", "iex"] {
+            let script = format!(
+                "$p.UseShellExecute=$false; $expr='Start-'+'Process https://example.com'; {command} $expr"
+            );
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", &script])),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_literal_false_shell_execute_preserves_dangerous_cases() {
+        for script in [
+            "$p.UseShellExecute=$false; Start-Process 'https://example.com'",
+            "$p.UseShellExecute=$false; Invoke-Item 'https://example.com'",
+            "$p.UseShellExecute=$false; $p.FileName='https://example.com'; [Diagnostics.Process]::Start($p)",
+            "$p.UseShellExecute=$false; $shell.ShellExecute('https://example.com')",
+            "$p.UseShellExecute=$enabled; $url='https://example.com'",
+            "$p.UseShellExecute=$false; $url='https://example.com'; if (",
+            "$p.UseShellExecute=$false; $url='https://example.com'; Remove-Item test -Force",
+        ] {
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["pwsh", "-Command", script])),
+                "{script}"
+            );
+        }
     }
 
     #[test]
