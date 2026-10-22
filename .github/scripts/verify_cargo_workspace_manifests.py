@@ -26,7 +26,6 @@ UTILITY_NAME_EXCEPTIONS = {
     "path-utils": "codex-utils-path",
 }
 MANIFEST_FEATURE_EXCEPTIONS = {
-    "codex-rs/code-mode/Cargo.toml": {"sandbox": ("v8/v8_enable_sandbox",)},
     "codex-rs/v8-poc/Cargo.toml": {"sandbox": ("v8/v8_enable_sandbox",)},
 }
 OPTIONAL_DEPENDENCY_EXCEPTIONS = set()
@@ -227,7 +226,7 @@ def is_workspace_reference(value: object) -> bool:
 
 
 def manifest_key(path: Path) -> str:
-    return str(path.relative_to(ROOT))
+    return path.relative_to(ROOT).as_posix()
 
 
 def normalize_feature_mapping(value: object) -> dict[str, tuple[str, ...]] | None:
