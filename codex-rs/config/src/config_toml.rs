@@ -94,6 +94,15 @@ const fn default_true() -> bool {
     true
 }
 
+/// Transport used to deliver the payload to the legacy `notify` command.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotifyPayloadTransport {
+    #[default]
+    Argv,
+    Stdin,
+}
+
 /// Backward-compatible shape for ChatGPT workspace login restrictions in config.toml.
 #[derive(Serialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(untagged)]
@@ -245,6 +254,10 @@ pub struct ConfigToml {
     /// Optional external command to spawn for end-user notifications.
     #[serde(default)]
     pub notify: Option<Vec<String>>,
+
+    /// Transport used for the legacy `notify` payload. Defaults to `argv`.
+    #[serde(default)]
+    pub notify_payload_transport: NotifyPayloadTransport,
 
     /// System instructions.
     pub instructions: Option<String>,
@@ -1063,6 +1076,32 @@ mod tests {
                     .expect_err("idle timeout must be a nonnegative integer");
             assert!(error.to_string().contains("thread_unload_delay_secs"));
         }
+    }
+
+    #[test]
+    fn notify_payload_transport_defaults_to_argv() {
+        let config = toml::from_str::<ConfigToml>("").expect("empty config should deserialize");
+        assert_eq!(
+            config.notify_payload_transport,
+            NotifyPayloadTransport::Argv
+        );
+    }
+
+    #[test]
+    fn notify_payload_transport_accepts_stdin() {
+        let config = toml::from_str::<ConfigToml>(r#"notify_payload_transport = "stdin""#)
+            .expect("stdin transport should deserialize");
+        assert_eq!(
+            config.notify_payload_transport,
+            NotifyPayloadTransport::Stdin
+        );
+    }
+
+    #[test]
+    fn notify_payload_transport_rejects_unknown_values() {
+        let error = toml::from_str::<ConfigToml>(r#"notify_payload_transport = "pipe""#)
+            .expect_err("unknown transport should fail");
+        assert!(error.to_string().contains("notify_payload_transport"));
     }
 
     #[test]

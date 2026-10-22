@@ -5579,6 +5579,7 @@ async fn build_hooks_config(
     let plugin_hook_load_warnings = plugin_outcome.effective_plugin_hook_warnings();
     HooksConfig {
         legacy_notify_argv: config.notify.clone(),
+        notify_payload_transport: config.notify_payload_transport,
         feature_enabled: config.features.enabled(Feature::CodexHooks),
         bypass_hook_trust: config.bypass_hook_trust,
         config_layer_stack: Some(config.config_layer_stack.clone()),

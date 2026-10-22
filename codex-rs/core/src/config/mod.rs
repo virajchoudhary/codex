@@ -792,6 +792,9 @@ pub struct Config {
     /// If unset the feature is disabled.
     pub notify: Option<Vec<String>>,
 
+    /// Transport used for the legacy `notify` payload.
+    pub notify_payload_transport: codex_config::config_toml::NotifyPayloadTransport,
+
     /// TUI notification settings, including enabled events, delivery method, and focus condition.
     pub tui_notifications: TuiNotificationSettings,
 
@@ -4486,6 +4489,7 @@ impl Config {
             approvals_reviewer: constrained_approvals_reviewer.value(),
             enforce_residency: enforce_residency.value,
             notify: cfg.notify,
+            notify_payload_transport: cfg.notify_payload_transport,
             base_instructions,
             base_instructions_provenance,
             personality,
