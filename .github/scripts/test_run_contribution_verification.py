@@ -600,11 +600,12 @@ class RunContributionVerificationTest(unittest.TestCase):
             task_root = Path(temp_dir)
             parent_pid_path = task_root / "parent.pid"
             child_pid_path = task_root / "child.pid"
+            parent_ready_path = task_root / "parent.ready"
             child_code = (
                 "import os,pathlib,signal,sys,time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii'); "
                 "print('descendant ignores TERM', flush=True); "
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii'); "
                 "time.sleep(30)"
             )
             parent_code = (
@@ -617,11 +618,12 @@ class RunContributionVerificationTest(unittest.TestCase):
                 "if not pathlib.Path(sys.argv[2]).exists():\n"
                 "    raise SystemExit('child not ready')\n"
                 "print('leader waiting for cleanup', flush=True)\n"
+                "pathlib.Path(sys.argv[4]).write_text('ready', encoding='ascii')\n"
                 "time.sleep(30)\n"
             )
 
             def disk_usage(_path: str | os.PathLike[str]) -> DiskUsage:
-                free = 0 if child_pid_path.exists() else 100
+                free = 0 if parent_ready_path.exists() else 100
                 return DiskUsage(total=100, used=100 - free, free=free)
 
             started = time.monotonic()
@@ -645,6 +647,7 @@ class RunContributionVerificationTest(unittest.TestCase):
                                     child_code,
                                     str(child_pid_path),
                                     str(parent_pid_path),
+                                    str(parent_ready_path),
                                 ),
                             ),
                             cwd=task_root,
@@ -664,6 +667,7 @@ class RunContributionVerificationTest(unittest.TestCase):
                 assert result is not None
                 self.assertTrue(parent_pid_path.is_file())
                 self.assertTrue(child_pid_path.is_file())
+                self.assertTrue(parent_ready_path.is_file())
                 log = Path(result.log_path).read_text(encoding="utf-8")
                 self.assertIn("leader waiting for cleanup", log)
                 self.assertIn("descendant ignores TERM", log)
