@@ -228,7 +228,7 @@ def test_shipping_legacy_registration_preserves_the_reserved_protocol_environmen
     )
 
     assert command == [
-        "/opt/codex",
+        str(Path("/opt/codex")),
         "mcp",
         "add",
         "mcp_spec_fixture",
@@ -236,7 +236,7 @@ def test_shipping_legacy_registration_preserves_the_reserved_protocol_environmen
         f"CODEX_MCP_PROTOCOL_VERSION={LEGACY_ENVIRONMENT_SENTINEL}",
         "--",
         sys.executable,
-        "/src/server.py",
+        str(Path("/src/server.py")),
         "--mode",
         SHIPPING_LEGACY_VERSION,
         "--transport",
