@@ -279,6 +279,89 @@ def test_root_format_driver_covers_all_formatter_groups(
     ]
 
 
+def test_root_format_driver_skips_rustfmt_without_rust_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    script = _load_root_format_script_module()
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+
+    def fake_check_output(args, *, cwd):
+        assert args == [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.rs",
+        ]
+        assert cwd == tmp_path
+        return b""
+
+    monkeypatch.setattr(script.subprocess, "check_output", fake_check_output)
+
+    for check in (False, True):
+        assert script.rust_formatter_group(check=check) == script.FormatterGroup("Rust", ())
+
+
+def test_root_format_driver_batches_large_rustfmt_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    script = _load_root_format_script_module()
+    rust_root = tmp_path / "codex-rs"
+    rust_root.mkdir()
+    file_names = [f"spaced unicode path {index:04} café.rs" for index in range(1000)]
+    for name in file_names:
+        (rust_root / name).touch()
+    listed_paths = [f"codex-rs/{name}".encode("utf-8") for name in file_names]
+    git_ls_files_args = [
+        "git",
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--",
+        "*.rs",
+    ]
+
+    def fake_check_output(args, *, cwd):
+        assert args == git_ls_files_args
+        assert cwd == tmp_path
+        return b"\0".join(listed_paths) + b"\0"
+
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(script.subprocess, "check_output", fake_check_output)
+
+    for check in (False, True):
+        group = script.rust_formatter_group(check=check)
+        assert len(group.commands) > 1
+        command_prefix = (
+            "rustfmt",
+            "--edition",
+            "2024",
+            "--config-path",
+            str(rust_root / "rustfmt.toml"),
+            "--config",
+            "imports_granularity=Item,skip_children=true",
+            *(("--check",) if check else ()),
+        )
+        formatted_files: list[str] = []
+        for command in group.commands:
+            assert command.cwd == rust_root
+            assert command.args[: len(command_prefix)] == command_prefix
+            command_line = script.subprocess.list2cmdline(command.args)
+            command_line_units = len(command_line.encode("utf-16-le")) // 2 + 1
+            assert command_line_units <= 28_000
+            formatted_files.extend(command.args[len(command_prefix) :])
+
+        assert formatted_files == sorted(file_names)
+        assert len(formatted_files) == len(set(formatted_files))
+
+
 def test_root_format_driver_discards_successful_command_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
