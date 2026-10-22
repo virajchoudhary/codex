@@ -142,6 +142,26 @@ class SelectWindowsBazelTargetsTest(unittest.TestCase):
                 self.assertEqual(result.stdout, b"")
                 self.assertIn(error, result.stderr)
 
+    def test_windows_bazelrc_forwards_localappdata_only_via_platform_config(
+        self,
+    ) -> None:
+        bazelrc = Path(__file__).resolve().parents[2] / ".bazelrc"
+        options = [
+            line.strip()
+            for line in bazelrc.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+        self.assertIn("common --enable_platform_specific_config", options)
+        self.assertEqual(
+            [
+                option
+                for option in options
+                if "--test_env=LOCALAPPDATA" in option
+            ],
+            ["common:windows --test_env=LOCALAPPDATA"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
