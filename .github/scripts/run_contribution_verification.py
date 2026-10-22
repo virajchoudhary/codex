@@ -220,6 +220,27 @@ def build_test_commands(platform_name: str) -> list[TestCommand]:
     commands = [
         TestCommand("model-provider", _cargo_test("codex-model-provider")),
         TestCommand("core-exec-policy", _cargo_test("codex-core", "exec_policy")),
+        TestCommand(
+            "thread-store-model-context",
+            _cargo_test("codex-thread-store", "model_context::tests"),
+        ),
+        TestCommand(
+            "app-server-paginated-resume",
+            (
+                "cargo",
+                "test",
+                "--locked",
+                "--jobs",
+                "2",
+                "--package",
+                "codex-app-server",
+                "--test",
+                "all",
+                "mcp_resource",
+                "--",
+                "--test-threads=1",
+            ),
+        ),
     ]
     if platform_name == "darwin":
         commands.append(

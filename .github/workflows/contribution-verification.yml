@@ -1,9 +1,9 @@
-name: Contribution verification
+name: Current-upstream contribution verification
 
 on:
   push:
     branches:
-      - "contribution/verification-20261022"
+      - "contribution/verification-current-20261022"
 
 permissions:
   contents: read
@@ -13,6 +13,10 @@ jobs:
     if: github.repository == 'virajchoudhary/codex'
     runs-on: windows-2025
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [thread-store-model-context, app-server-paginated-resume]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -35,17 +39,17 @@ jobs:
         with:
           components: clippy,rustfmt,rust-src
 
-      - name: Run remaining Windows TUI tests
+      - name: Run selected Windows history tests
         shell: pwsh
         env:
           RUST_MIN_STACK: "8388608"
-        run: python -B .github/scripts/run_contribution_verification.py --run --task-root $env:CONTRIB_TASK_ROOT --tests tui-startup-defaults
+        run: python -B .github/scripts/run_contribution_verification.py --run --task-root $env:CONTRIB_TASK_ROOT --tests ${{ matrix.test }}
 
       - name: Upload bounded verification evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: contribution-verification-windows-${{ github.sha }}
+          name: contribution-verification-windows-${{ matrix.test }}-${{ github.sha }}
           path: ${{ runner.temp }}/cx-${{ github.run_id }}-${{ github.run_attempt }}/evidence
           if-no-files-found: warn
           retention-days: 7
@@ -54,6 +58,10 @@ jobs:
     if: github.repository == 'virajchoudhary/codex'
     runs-on: macos-15
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [thread-store-model-context, app-server-paginated-resume]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -76,17 +84,17 @@ jobs:
         with:
           components: clippy,rustfmt,rust-src
 
-      - name: Run remaining macOS TUI tests
+      - name: Run selected macOS history tests
         shell: bash
         env:
           RUST_MIN_STACK: "8388608"
-        run: python3 -B .github/scripts/run_contribution_verification.py --run --task-root "$CONTRIB_TASK_ROOT" --tests tui-startup-defaults
+        run: python3 -B .github/scripts/run_contribution_verification.py --run --task-root "$CONTRIB_TASK_ROOT" --tests ${{ matrix.test }}
 
       - name: Upload bounded verification evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: contribution-verification-macos-${{ github.sha }}
+          name: contribution-verification-macos-${{ matrix.test }}-${{ github.sha }}
           path: ${{ runner.temp }}/codex-contribution-verification-${{ github.run_id }}-${{ github.run_attempt }}/evidence
           if-no-files-found: warn
           retention-days: 7

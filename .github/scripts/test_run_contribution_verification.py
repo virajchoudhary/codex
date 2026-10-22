@@ -694,8 +694,8 @@ class RunContributionVerificationTest(unittest.TestCase):
     def test_mac_only_daemon_regression_is_not_scheduled_on_windows(self) -> None:
         windows = build_test_commands("win32")
         macos = build_test_commands("darwin")
-        self.assertEqual(len(windows), 4)
-        self.assertEqual(len(macos), 6)
+        self.assertEqual(len(windows), 6)
+        self.assertEqual(len(macos), 8)
         self.assertFalse(
             any(command.name == "app-server-daemon-selection" for command in windows)
         )
@@ -710,6 +710,51 @@ class RunContributionVerificationTest(unittest.TestCase):
             ),
             1,
         )
+
+    def test_history_context_groups_use_the_expected_test_targets(self) -> None:
+        for platform_name in ("win32", "darwin"):
+            with self.subTest(platform_name=platform_name):
+                context = select_test_commands(
+                    platform_name, ["thread-store-model-context"]
+                )
+                self.assertEqual(len(context), 1)
+                self.assertEqual(
+                    context[0].argv,
+                    (
+                        "cargo",
+                        "test",
+                        "--locked",
+                        "--jobs",
+                        "2",
+                        "--package",
+                        "codex-thread-store",
+                        "--lib",
+                        "model_context::tests",
+                        "--",
+                        "--test-threads=1",
+                    ),
+                )
+                resume = select_test_commands(
+                    platform_name, ["app-server-paginated-resume"]
+                )
+                self.assertEqual(len(resume), 1)
+                self.assertEqual(
+                    resume[0].argv,
+                    (
+                        "cargo",
+                        "test",
+                        "--locked",
+                        "--jobs",
+                        "2",
+                        "--package",
+                        "codex-app-server",
+                        "--test",
+                        "all",
+                        "mcp_resource",
+                        "--",
+                        "--test-threads=1",
+                    ),
+                )
 
     def test_default_selection_returns_the_full_platform_catalog(self) -> None:
         for platform_name in ("win32", "darwin"):
