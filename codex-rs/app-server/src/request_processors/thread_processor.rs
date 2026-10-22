@@ -11,6 +11,8 @@ use super::thread_enrichment::enrich_loaded_threads;
 use super::thread_fork_goal::inherit_thread_goal_snapshot;
 use super::thread_input::can_accept_direct_input;
 use super::thread_input::ensure_direct_input_allowed;
+use super::turn_processor::ThreadEnvironmentOverride;
+use super::turn_processor::ThreadSettingsBuildParams;
 use super::*;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::error_code::method_not_found;
@@ -4578,6 +4580,79 @@ impl ThreadRequestProcessor {
         Some(persisted_metadata)
     }
 
+    async fn apply_loaded_resume_settings(
+        &self,
+        thread: &CodexThread,
+        params: &ThreadResumeParams,
+    ) -> Result<(), JSONRPCErrorError> {
+        let sandbox_policy = if let Some(sandbox) = params.sandbox {
+            let snapshot = thread.config_snapshot().await;
+            let thread_config = thread.config().await;
+            let config = self
+                .config_manager
+                .load_config_for_thread(
+                    &thread_config,
+                    snapshot.cwd().clone(),
+                    ConfigOverrides {
+                        sandbox_mode: Some(sandbox.to_core()),
+                        approval_policy: params
+                            .approval_policy
+                            .clone()
+                            .map(codex_app_server_protocol::AskForApproval::to_core),
+                        workspace_roots: Some(snapshot.workspace_roots),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| config_load_error(&error))?;
+            let requested_mode = codex_config::SandboxModeRequirement::from(sandbox.to_core());
+            let resolved_mode = codex_config::sandbox_mode_requirement_for_permission_profile(
+                &config.permissions.effective_permission_profile(),
+            );
+            if resolved_mode != requested_mode
+                && !(requested_mode == codex_config::SandboxModeRequirement::DangerFullAccess
+                    && resolved_mode == codex_config::SandboxModeRequirement::ExternalSandbox)
+            {
+                return Err(invalid_request(format!(
+                    "requested sandbox mode {sandbox:?} was not applied"
+                )));
+            }
+            Some(config.legacy_sandbox_policy().into())
+        } else {
+            None
+        };
+        let settings = TurnRequestProcessor::build_thread_settings_overrides(
+            &self.config_manager,
+            thread,
+            ThreadSettingsBuildParams {
+                method: "thread/resume",
+                disabled_plugin_ids: None,
+                environment_override: ThreadEnvironmentOverride::default(),
+                approval_policy: params.approval_policy.clone(),
+                approvals_reviewer: params.approvals_reviewer,
+                sandbox_policy,
+                permissions: params.permissions.clone(),
+                model: None,
+                service_tier: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+            },
+        )
+        .await?;
+        if settings != codex_protocol::protocol::ThreadSettingsOverrides::default() {
+            thread
+                .update_thread_settings(settings)
+                .await
+                .map_err(|error| match error.details() {
+                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                    _ => internal_error(format!("failed to apply resume settings: {error}")),
+                })?;
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn resume_running_thread(
         &self,
@@ -4646,7 +4721,7 @@ impl ThreadRequestProcessor {
                     active_path.display()
                 )));
             }
-            let (config_snapshot, selected_service_tier) =
+            let (mut config_snapshot, mut selected_service_tier) =
                 existing_thread.resume_config_snapshot().await;
             let mismatch_details = collect_resume_override_mismatches(
                 params,
@@ -4694,13 +4769,40 @@ impl ThreadRequestProcessor {
                     }
                 }
 
-                // Preserve rejoin semantics when another client can still observe
-                // the loaded thread or shutdown did not complete.
-                tracing::warn!(
-                    "thread/resume overrides ignored for loaded thread {}: {}",
-                    existing_thread_id,
-                    mismatch_details.join("; ")
-                );
+                let ignored_overrides = if can_accept_direct_input(
+                    existing_thread.multi_agent_version(),
+                    &config_snapshot.session_source,
+                ) {
+                    self.apply_loaded_resume_settings(existing_thread.as_ref(), params)
+                        .await?;
+                    (config_snapshot, selected_service_tier) =
+                        existing_thread.resume_config_snapshot().await;
+                    collect_resume_override_mismatches(
+                        &ThreadResumeParams {
+                            model: params.model.clone(),
+                            model_provider: params.model_provider.clone(),
+                            service_tier: params.service_tier.clone(),
+                            cwd: params.cwd.clone(),
+                            runtime_workspace_roots: params.runtime_workspace_roots.clone(),
+                            config: params.config.clone(),
+                            base_instructions: params.base_instructions.clone(),
+                            developer_instructions: params.developer_instructions.clone(),
+                            personality: params.personality,
+                            ..Default::default()
+                        },
+                        &config_snapshot,
+                        selected_service_tier.as_deref(),
+                    )
+                } else {
+                    mismatch_details
+                };
+                if !ignored_overrides.is_empty() {
+                    tracing::warn!(
+                        "thread/resume overrides ignored for loaded thread {}: {}",
+                        existing_thread_id,
+                        ignored_overrides.join("; ")
+                    );
+                }
             }
             let redact_resume_payloads =
                 should_redact_thread_resume_payloads(app_server_client_name.as_deref());
@@ -5440,7 +5542,10 @@ impl ThreadRequestProcessor {
             /*personality*/ None,
         );
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
-        let restore_approval_policy = typesafe_overrides.approval_policy.is_none();
+        let restore_approval_policy = typesafe_overrides.approval_policy.is_none()
+            && !request_overrides
+                .as_ref()
+                .is_some_and(|overrides| overrides.contains_key("approval_policy"));
         let restore_approvals_reviewer = typesafe_overrides.approvals_reviewer.is_none()
             && !request_overrides
                 .as_ref()

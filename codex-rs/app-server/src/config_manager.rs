@@ -502,11 +502,11 @@ impl ConfigManager {
     }
 
     /// Reload sources using the task's session flags before materializing config.
-    pub(crate) async fn load_permission_config_for_thread(
+    pub(crate) async fn load_config_for_thread(
         &self,
         thread_config: &Config,
         cwd: AbsolutePathBuf,
-        permission_profile: String,
+        mut typesafe_overrides: ConfigOverrides,
     ) -> std::io::Result<Config> {
         let mut session_flags = TomlValue::Table(Default::default());
         for layer in thread_config.config_layer_stack.layers_low_to_high() {
@@ -525,15 +525,13 @@ impl ConfigManager {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<Vec<_>>();
+        typesafe_overrides.cwd = Some(cwd.to_path_buf());
+        typesafe_overrides.codex_linux_sandbox_exe =
+            self.arg0_paths.codex_linux_sandbox_exe.clone();
         self.load_with_cli_overrides(
             &overrides,
             /*request_overrides*/ None,
-            ConfigOverrides {
-                cwd: Some(cwd.to_path_buf()),
-                default_permissions: Some(permission_profile),
-                codex_linux_sandbox_exe: self.arg0_paths.codex_linux_sandbox_exe.clone(),
-                ..Default::default()
-            },
+            typesafe_overrides,
             Some(cwd.to_path_buf()),
         )
         .await
