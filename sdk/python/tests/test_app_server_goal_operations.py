@@ -76,7 +76,7 @@ def test_private_goal_operation_coalesces_runtime_continuations(tmp_path) -> Non
         "request_count": len(requests),
         "objective_reached_model": (
             "<objective>\nImprove benchmark coverage\n</objective>"
-            in "\n".join(requests[0].message_input_texts("user"))
+            in "\n".join(requests[0].message_input_texts("user")).replace("\r\n", "\n")
         ),
         "routes_after_completion": routes,
     } == {
