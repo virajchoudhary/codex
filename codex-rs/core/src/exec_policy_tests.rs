@@ -2498,6 +2498,31 @@ async fn windows_powershell_policy_classifies_only_independent_literal_commands(
             "Start-Process notepad.exe; Invoke-WebRequest 'http://127.0.0.1/health'",
             Decision::Allow,
         ),
+        (
+            "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+             $diagnostic.UseShellExecute = $false\n\
+             $diagnostic.Arguments = 'https://example.com'\n\
+             Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+            Decision::Forbidden,
+        ),
+        (
+            "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+             $diagnostic.UseShellExecute = $false\n\
+             $diagnostic.Arguments = 'https://example.com'\n\
+             $diagnostic.UseShellExecute",
+            Decision::Forbidden,
+        ),
+        (
+            "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+             $diagnostic.UseShellExecute = $false\n\
+             $diagnostic.Arguments = 'https://example.com'\n\
+             Microsoft.PowerShell.Utility\\Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+            Decision::Forbidden,
+        ),
+        (
+            "$p.UseShellExecute=$false; $p.FileName='https://example.com'; [Diagnostics.Process]::Start($p)",
+            Decision::Forbidden,
+        ),
         ("Start-Process 'https://example.com'", Decision::Forbidden),
         (
             "Write-Output start 'https://example.com' | Out-String",
@@ -2562,5 +2587,125 @@ async fn windows_powershell_policy_classifies_only_independent_literal_commands(
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn windows_no_profile_direct_member_diagnostic_preserves_explicit_exec_policy() {
+    let command = vec_str(&[
+        "powershell",
+        "-NonInteractive",
+        "-NoProfile",
+        "-Command",
+        "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+         $diagnostic.UseShellExecute = $false\n\
+         $diagnostic.Arguments = 'https://example.com'\n\
+         $diagnostic.UseShellExecute",
+    ]);
+    for (policy_src, approval_policy) in [
+        (None, AskForApproval::Never),
+        (
+            Some(r#"prefix_rule(pattern=["powershell"], decision="forbidden")"#),
+            AskForApproval::Never,
+        ),
+        (
+            Some(r#"prefix_rule(pattern=["powershell"], decision="prompt")"#),
+            AskForApproval::Never,
+        ),
+        (
+            Some(r#"prefix_rule(pattern=["powershell"], decision="prompt")"#),
+            AskForApproval::OnRequest,
+        ),
+    ] {
+        let policy = ExecPolicyManager::new(policy_from_src(policy_src));
+        let requirement = policy
+            .create_exec_approval_requirement_for_command_platform(
+                ExecApprovalRequest {
+                    command: &command,
+                    approval_policy,
+                    permission_profile: PermissionProfile::Disabled,
+                    environment_policy: None,
+                    windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+                    sandbox_permissions: SandboxPermissions::UseDefault,
+                    prefix_rule: None,
+                    allow_prefix_rules: AllowPrefixRules::Honor,
+                },
+                DangerousCommandPlatform::Windows,
+            )
+            .await;
+        if policy_src.is_none() {
+            assert!(
+                matches!(requirement, ExecApprovalRequirement::Skip { .. }),
+                "{requirement:?}"
+            );
+        } else if approval_policy == AskForApproval::Never {
+            assert!(
+                matches!(requirement, ExecApprovalRequirement::Forbidden { .. }),
+                "{requirement:?}"
+            );
+        } else {
+            assert!(
+                matches!(requirement, ExecApprovalRequirement::NeedsApproval { .. }),
+                "{requirement:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn windows_powershell_diagnostic_requires_no_profile_and_no_commands() {
+    let assignments = "$diagnostic = [System.Diagnostics.ProcessStartInfo]::new()\n\
+        $diagnostic.UseShellExecute = $false\n\
+        $diagnostic.Arguments = 'https://example.com'";
+    for (flags, final_statement) in [
+        (&["-Command"][..], "$diagnostic.UseShellExecute"),
+        (
+            &["-NoProfile", "-Command"][..],
+            "Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+        ),
+        (
+            &["-NoProfile", "-Command"][..],
+            "Microsoft.PowerShell.Utility\\Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+        ),
+        (
+            &["-NoProfile", "-NoLogo", "-Command"][..],
+            "$diagnostic.UseShellExecute",
+        ),
+        (
+            &["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"][..],
+            "$diagnostic.UseShellExecute",
+        ),
+        (
+            &["-NoP", "-Command"][..],
+            "Write-Output 'Diagnostic only: no process was started and no network request was made.'",
+        ),
+    ] {
+        let script = format!("{assignments}\n{final_statement}");
+        let command = [
+            vec_str(&["powershell"]),
+            vec_str(flags),
+            vec_str(&[&script]),
+        ]
+        .concat();
+        let policy = ExecPolicyManager::new(Arc::new(Policy::empty()));
+        let requirement = policy
+            .create_exec_approval_requirement_for_command_platform(
+                ExecApprovalRequest {
+                    command: &command,
+                    approval_policy: AskForApproval::Never,
+                    permission_profile: PermissionProfile::Disabled,
+                    environment_policy: None,
+                    windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+                    sandbox_permissions: SandboxPermissions::UseDefault,
+                    prefix_rule: None,
+                    allow_prefix_rules: AllowPrefixRules::Honor,
+                },
+                DangerousCommandPlatform::Windows,
+            )
+            .await;
+        assert!(
+            matches!(requirement, ExecApprovalRequirement::Forbidden { .. }),
+            "{command:?}; got {requirement:?}"
+        );
     }
 }
