@@ -32,7 +32,7 @@ impl ExecPolicyManager {
                     let commands = parse_powershell_script_into_plain_commands(script);
                     let command_origin = commands
                         .as_ref()
-                        .map_or(ExecPolicyCommandOrigin::PowerShell, |commands| {
+                        .map_or(ExecPolicyCommandOrigin::Generic, |commands| {
                             powershell_command_origin(script, commands)
                         });
                     ExecPolicyCommands {

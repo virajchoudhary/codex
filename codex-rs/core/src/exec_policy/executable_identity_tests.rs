@@ -1,8 +1,64 @@
 use super::shell_approval_command;
+use crate::exec_policy::AllowPrefixRules;
+use crate::exec_policy::ExecApprovalRequest;
+use crate::exec_policy::ExecPolicyManager;
+use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::shell::ShellType;
+use crate::tools::sandboxing::ExecApprovalRequirement;
+use codex_execpolicy::Policy;
+use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
+use codex_shell_command::is_dangerous_command::DangerousCommandPlatform;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+#[tokio::test]
+async fn unfamiliar_powershell_opaque_scripts_keep_wrapper_heuristics() {
+    let shell = Shell {
+        shell_type: ShellType::PowerShell,
+        shell_path: PathBuf::from("other-shell"),
+    };
+    for script in [
+        "$p = [System.Diagnostics.ProcessStartInfo]::new(); $p.UseShellExecute = $false; $p.Arguments = 'https://example.com'; $p.UseShellExecute",
+        "$p.UseShellExecute=$false; $p.FileName='https://example.com'; [Diagnostics.Process]::Start($p)",
+    ] {
+        let command = vec![
+            "pwsh".to_string(),
+            "-Command".to_string(),
+            script.to_string(),
+        ];
+        for approval_policy in [AskForApproval::Never, AskForApproval::OnRequest] {
+            let manager = ExecPolicyManager::new(Arc::new(Policy::empty()));
+            let requirement = manager
+                .create_exec_approval_requirement_for_shell(
+                    ExecApprovalRequest {
+                        command: &command,
+                        approval_policy,
+                        permission_profile: PermissionProfile::Disabled,
+                        environment_policy: None,
+                        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                        sandbox_permissions: SandboxPermissions::UseDefault,
+                        prefix_rule: None,
+                        allow_prefix_rules: AllowPrefixRules::Honor,
+                    },
+                    &shell,
+                    DangerousCommandPlatform::Windows,
+                )
+                .await;
+            assert!(
+                if approval_policy == AskForApproval::Never {
+                    matches!(requirement, ExecApprovalRequirement::Forbidden { .. })
+                } else {
+                    matches!(requirement, ExecApprovalRequirement::NeedsApproval { .. })
+                },
+                "{command:?}; {approval_policy:?}; {requirement:?}"
+            );
+        }
+    }
+}
 
 #[test]
 fn parent_directory_traversal_is_not_a_trusted_system_shell() {
