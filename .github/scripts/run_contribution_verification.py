@@ -35,6 +35,13 @@ WINDOWS_CREATE_SUSPENDED = 0x00000004
 WINDOWS_TH32CS_SNAPTHREAD = 0x00000004
 WINDOWS_THREAD_SUSPEND_RESUME = 0x0002
 WINDOWS_ERROR_NO_MORE_FILES = 18
+MANAGED_CARGO_ENV = {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_DEV_INCREMENTAL": "false",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_PROFILE_TEST_INCREMENTAL": "false",
+}
 
 
 class VerificationError(RuntimeError):
@@ -120,7 +127,9 @@ def validate_task_root(
         if not root.is_absolute() or not temp.is_absolute():
             raise VerificationError("Windows task paths must be absolute")
         if root.drive.casefold() != "d:" or temp.drive.casefold() != "d:":
-            raise VerificationError("Windows task root, Rust, Cargo, and temp must stay on D:")
+            raise VerificationError(
+                "Windows task root, Rust, Cargo, and temp must stay on D:"
+            )
         if root == temp:
             raise VerificationError("task root must be a child of RUNNER_TEMP")
         try:
@@ -311,7 +320,9 @@ def _process_group_has_members(process: subprocess.Popen[bytes]) -> bool:
     return True
 
 
-def _wait_for_process_group_exit(process: subprocess.Popen[bytes], timeout: float) -> bool:
+def _wait_for_process_group_exit(
+    process: subprocess.Popen[bytes], timeout: float
+) -> bool:
     deadline = time.monotonic() + timeout
     while _process_group_has_members(process):
         remaining = deadline - time.monotonic()
@@ -489,7 +500,9 @@ class _WindowsProcessJob:
             if previous_suspend_count == 0xFFFFFFFF:
                 raise self._ctypes.WinError(self._ctypes.get_last_error())
             if previous_suspend_count != 1:
-                raise VerificationError("suspended verifier thread had an unexpected suspend count")
+                raise VerificationError(
+                    "suspended verifier thread had an unexpected suspend count"
+                )
         finally:
             self._kernel32.CloseHandle(thread_handle)
 
@@ -601,7 +614,9 @@ def run_test_command(
 
     job = _WindowsProcessJob() if os.name == "nt" else None
     creationflags = (
-        subprocess.CREATE_NEW_PROCESS_GROUP | WINDOWS_CREATE_SUSPENDED if os.name == "nt" else 0
+        subprocess.CREATE_NEW_PROCESS_GROUP | WINDOWS_CREATE_SUSPENDED
+        if os.name == "nt"
+        else 0
     )
     process: subprocess.Popen[bytes] | None = None
     job_assigned = False
@@ -675,7 +690,9 @@ def run_test_command(
                 if process.stdout is not None:
                     process.stdout.close()
 
-        reader = threading.Thread(target=drain_output, name=f"log-{spec.name}", daemon=True)
+        reader = threading.Thread(
+            target=drain_output, name=f"log-{spec.name}", daemon=True
+        )
         reader.start()
         started = time.monotonic()
         command_error: str | None = None
@@ -767,15 +784,7 @@ def _write_env_file(task_root: Path) -> dict[str, str]:
         path.mkdir(parents=True, exist_ok=True)
 
     values = {name: str(path) for name, path in directories.items()}
-    values.update(
-        {
-            "CARGO_INCREMENTAL": "0",
-            "CARGO_PROFILE_DEV_DEBUG": "0",
-            "CARGO_PROFILE_DEV_INCREMENTAL": "0",
-            "CARGO_PROFILE_TEST_DEBUG": "0",
-            "CARGO_PROFILE_TEST_INCREMENTAL": "0",
-        }
-    )
+    values.update(MANAGED_CARGO_ENV)
     env_file = os.environ.get("GITHUB_ENV")
     if not env_file:
         raise VerificationError("GITHUB_ENV is required to prepare the runner")
@@ -800,7 +809,9 @@ def prepare_environment(task_root_text: str) -> None:
     if task_root.exists():
         raise VerificationError(f"refusing to reuse task root: {task_root}")
     if shutil.disk_usage(runner_temp_path).free < MIN_FREE_BYTES:
-        raise ResourceLimitError(f"RUNNER_TEMP has less than {MIN_FREE_BYTES} bytes free")
+        raise ResourceLimitError(
+            f"RUNNER_TEMP has less than {MIN_FREE_BYTES} bytes free"
+        )
     task_root.mkdir(parents=False, exist_ok=False)
     values = _write_env_file(task_root)
     used, free = check_budgets(task_root)
@@ -846,19 +857,18 @@ def _validate_managed_environment(task_root: Path) -> dict[str, str]:
         resolved_value = Path(value).resolve()
         if resolved_value != expected_path.resolve():
             raise VerificationError(f"{name} is not bound to the task root")
-        if not _is_within(resolved_value, resolved_root) and name != "CONTRIB_TASK_ROOT":
+        if (
+            not _is_within(resolved_value, resolved_root)
+            and name != "CONTRIB_TASK_ROOT"
+        ):
             raise VerificationError(f"{name} escaped the task root")
         if sys.platform == "win32" and PureWindowsPath(value).drive.casefold() != "d:":
             raise VerificationError(f"{name} must stay on D:")
-    for name in (
-        "CARGO_INCREMENTAL",
-        "CARGO_PROFILE_DEV_DEBUG",
-        "CARGO_PROFILE_DEV_INCREMENTAL",
-        "CARGO_PROFILE_TEST_DEBUG",
-        "CARGO_PROFILE_TEST_INCREMENTAL",
-    ):
-        if os.environ.get(name) != "0":
-            raise VerificationError(f"{name} must be disabled for bounded builds")
+    for name, expected_value in MANAGED_CARGO_ENV.items():
+        if os.environ.get(name) != expected_value:
+            raise VerificationError(
+                f"{name} must be {expected_value} for bounded builds"
+            )
     return os.environ.copy()
 
 
@@ -870,7 +880,9 @@ def _verify_toolchain(repo_root: Path) -> dict[str, str]:
         toolchain = tomllib.load(source)
     channel = toolchain.get("toolchain", {}).get("channel")
     if channel != RUST_VERSION:
-        raise VerificationError(f"workflow expects Rust {RUST_VERSION}, repo pins {channel!r}")
+        raise VerificationError(
+            f"workflow expects Rust {RUST_VERSION}, repo pins {channel!r}"
+        )
     versions: dict[str, str] = {}
     for name in ("rustc", "cargo"):
         completed = subprocess.run(
@@ -905,7 +917,9 @@ def _git_sha(repo_root: Path) -> str:
         raise VerificationError(f"unexpected checkout SHA: {sha!r}")
     expected_sha = os.environ.get("GITHUB_SHA")
     if expected_sha and sha != expected_sha:
-        raise VerificationError(f"checkout SHA {sha} does not match event SHA {expected_sha}")
+        raise VerificationError(
+            f"checkout SHA {sha} does not match event SHA {expected_sha}"
+        )
     return sha
 
 

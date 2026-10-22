@@ -117,6 +117,33 @@ class RunContributionVerificationTest(unittest.TestCase):
             with self.assertRaisesRegex(VerificationError, "no tests executed"):
                 validate_test_result(result)
 
+    def test_profile_incremental_environment_uses_cargo_boolean_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_file = root / "github-env"
+            with patch.dict(os.environ, {"GITHUB_ENV": str(env_file)}):
+                values = run_contribution_verification._write_env_file(root)
+            self.assertEqual(values["CARGO_INCREMENTAL"], "0")
+            for name in (
+                "CARGO_PROFILE_DEV_INCREMENTAL",
+                "CARGO_PROFILE_TEST_INCREMENTAL",
+            ):
+                self.assertEqual(values[name], "false")
+                self.assertIn(f"{name}=false\n", env_file.read_text(encoding="utf-8"))
+            with patch.dict(os.environ, values):
+                run_contribution_verification._validate_managed_environment(root)
+                for name in (
+                    "CARGO_PROFILE_DEV_INCREMENTAL",
+                    "CARGO_PROFILE_TEST_INCREMENTAL",
+                ):
+                    with self.subTest(name=name), patch.dict(os.environ, {name: "0"}):
+                        with self.assertRaisesRegex(
+                            VerificationError, f"{name} must be"
+                        ):
+                            run_contribution_verification._validate_managed_environment(
+                                root
+                            )
+
     def test_failed_test_output_and_log_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             task_root = Path(temp_dir)
@@ -142,7 +169,9 @@ class RunContributionVerificationTest(unittest.TestCase):
                 validate_test_result(result)
             log_path = Path(result.log_path)
             self.assertTrue(log_path.is_file())
-            self.assertIn("sample::regression ... FAILED", log_path.read_text(encoding="utf-8"))
+            self.assertIn(
+                "sample::regression ... FAILED", log_path.read_text(encoding="utf-8")
+            )
             self.assertEqual(result.return_code, 101)
             self.assertEqual(result.summary.failed, 1)
             self.assertIsNotNone(result.log_sha256)
@@ -180,9 +209,13 @@ class RunContributionVerificationTest(unittest.TestCase):
                 free = 100 if calls < 10 else 0
                 return DiskUsage(total=100, used=100 - free, free=free)
 
-            code = "import time; print('owned child started', flush=True); time.sleep(10)"
+            code = (
+                "import time; print('owned child started', flush=True); time.sleep(10)"
+            )
             started = time.monotonic()
-            with self.assertRaisesRegex(ResourceLimitError, "reserve breached") as raised:
+            with self.assertRaisesRegex(
+                ResourceLimitError, "reserve breached"
+            ) as raised:
                 run_test_command(
                     CommandSpec("budget-breach", (sys.executable, "-c", code)),
                     cwd=task_root,
@@ -228,9 +261,13 @@ class RunContributionVerificationTest(unittest.TestCase):
             )
             self.assertLess(time.monotonic() - started, 5)
             self.assertEqual(result.return_code, 0)
-            self.assertIn("parent exited", Path(result.log_path).read_text(encoding="utf-8"))
+            self.assertIn(
+                "parent exited", Path(result.log_path).read_text(encoding="utf-8")
+            )
 
-    @unittest.skipUnless(os.name == "nt", "Windows process startup is platform-specific")
+    @unittest.skipUnless(
+        os.name == "nt", "Windows process startup is platform-specific"
+    )
     def test_windows_startup_failures_terminate_the_suspended_child(self) -> None:
         original_assign = run_contribution_verification._WindowsProcessJob.assign
         for stage in ("assignment", "resume"):
@@ -302,7 +339,9 @@ class RunContributionVerificationTest(unittest.TestCase):
                     f"Windows test process {process_ids[0]} survived {stage} failure",
                 )
 
-    @unittest.skipUnless(os.name == "nt", "Windows process startup is platform-specific")
+    @unittest.skipUnless(
+        os.name == "nt", "Windows process startup is platform-specific"
+    )
     def test_windows_child_waits_for_job_assignment_before_it_can_spawn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             task_root = Path(temp_dir)
@@ -345,7 +384,9 @@ class RunContributionVerificationTest(unittest.TestCase):
                     "assign",
                     delayed_assign,
                 ):
-                    with self.assertRaisesRegex(ResourceLimitError, "process deadline") as raised:
+                    with self.assertRaisesRegex(
+                        ResourceLimitError, "process deadline"
+                    ) as raised:
                         run_test_command(
                             CommandSpec(
                                 "suspended-job-assignment",
@@ -648,13 +689,18 @@ class RunContributionVerificationTest(unittest.TestCase):
         macos = build_test_commands("darwin")
         self.assertEqual(len(windows), 4)
         self.assertEqual(len(macos), 6)
-        self.assertFalse(any(command.name == "app-server-daemon-selection" for command in windows))
+        self.assertFalse(
+            any(command.name == "app-server-daemon-selection" for command in windows)
+        )
         self.assertEqual(
             sum(command.name == "app-server-daemon-selection" for command in macos),
             1,
         )
         self.assertEqual(
-            sum(command.name == "hooks-command-runner-process-group" for command in macos),
+            sum(
+                command.name == "hooks-command-runner-process-group"
+                for command in macos
+            ),
             1,
         )
 
