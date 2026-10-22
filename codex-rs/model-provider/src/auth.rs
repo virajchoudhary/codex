@@ -185,16 +185,14 @@ pub fn unauthenticated_auth_provider() -> SharedAuthProvider {
     Arc::new(UnauthenticatedAuthProvider)
 }
 
-/// Returns the provider-scoped auth manager when this provider uses command-backed auth.
-///
-/// Providers without custom auth continue using the caller-supplied base manager, when present.
 pub(crate) fn auth_manager_for_provider(
     auth_manager: Option<Arc<AuthManager>>,
     provider: &ModelProviderInfo,
 ) -> Option<Arc<AuthManager>> {
     match provider.auth.clone() {
         Some(config) => Some(AuthManager::external_bearer_only(config)),
-        None => auth_manager,
+        None if provider.requires_openai_auth || provider.is_amazon_bedrock() => auth_manager,
+        None => None,
     }
 }
 
