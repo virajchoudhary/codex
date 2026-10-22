@@ -59,7 +59,7 @@ def test_registration_commands_select_stdio_then_http_shapes() -> None:
     )
 
     assert stdio == [
-        "/opt/codex",
+        str(codex),
         "mcp",
         "add",
         TEST_SERVER_NAME,
@@ -67,14 +67,14 @@ def test_registration_commands_select_stdio_then_http_shapes() -> None:
         f"CODEX_MCP_PROTOCOL_VERSION={MODERN_VERSION}",
         "--",
         sys.executable,
-        "/src/server.py",
+        str(server),
         "--mode",
         MODERN_VERSION,
         "--transport",
         "stdio",
     ]
     assert http == [
-        "/opt/codex",
+        str(codex),
         "mcp",
         "add",
         TEST_SERVER_NAME,
