@@ -12,6 +12,8 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Leave headroom below Windows' 32,767 UTF-16-unit CreateProcess limit.
+RUSTFMT_COMMAND_LINE_BUDGET_UNITS = 28_000
 
 
 @dataclass(frozen=True)
@@ -41,11 +43,71 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
-    args = ["cargo", "fmt", "--", "--config", "imports_granularity=Item"]
+    rust_root = REPO_ROOT / "codex-rs"
+    repository_files = subprocess.check_output(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.rs",
+        ],
+        cwd=REPO_ROOT,
+    ).split(b"\0")
+    rust_files: list[str] = []
+    for encoded_path in repository_files:
+        if not encoded_path:
+            continue
+        path = REPO_ROOT / Path(os.fsdecode(encoded_path))
+        if path.is_file():
+            rust_files.append(os.path.relpath(path, rust_root))
+    rust_files.sort()
+    if not rust_files:
+        return FormatterGroup("Rust", ())
+
+    args = [
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--config-path",
+        str(rust_root / "rustfmt.toml"),
+        "--config",
+        "imports_granularity=Item,skip_children=true",
+    ]
     if check:
         args.append("--check")
-    command = Command(tuple(args), REPO_ROOT / "codex-rs")
-    return FormatterGroup("Rust", (command,))
+
+    def command_line_units(command_args: tuple[str, ...] | list[str]) -> int:
+        command_line = subprocess.list2cmdline(command_args)
+        return len(command_line.encode("utf-16-le")) // 2 + 1
+
+    commands: list[Command] = []
+    current_files: list[str] = []
+    for path in rust_files:
+        candidate = (*args, *current_files, path)
+        if (
+            current_files
+            and command_line_units(candidate) > RUSTFMT_COMMAND_LINE_BUDGET_UNITS
+        ):
+            commands.append(Command(tuple((*args, *current_files)), rust_root))
+            current_files = [path]
+        else:
+            current_files.append(path)
+
+        if (
+            command_line_units((*args, *current_files))
+            > RUSTFMT_COMMAND_LINE_BUDGET_UNITS
+        ):
+            raise ValueError(
+                f"Rust source path exceeds the rustfmt command-line budget: {path!r}"
+            )
+
+    if current_files:
+        commands.append(Command(tuple((*args, *current_files)), rust_root))
+    return FormatterGroup("Rust", tuple(commands))
 
 
 def buildifier_formatter_group(*, check: bool) -> FormatterGroup:
