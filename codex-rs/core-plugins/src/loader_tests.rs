@@ -11,7 +11,9 @@ use codex_config::config_toml::ConfigToml;
 use codex_plugin::PluginId;
 use codex_utils_plugins::AGENT_PLUGIN_SCHEMA_URI;
 use pretty_assertions::assert_eq;
+use std::sync::Mutex;
 use tempfile::TempDir;
+use tracing_test::internal::MockWriter;
 
 fn user_config_path(temp_dir: &TempDir, file_name: &str) -> AbsolutePathBuf {
     AbsolutePathBuf::from_absolute_path(temp_dir.path().join(file_name))
@@ -49,6 +51,51 @@ async fn agent_plugin_overlay_apps_are_not_runtime_active() {
         load_plugin_apps(&plugin_root, &PluginId::parse("plugin@test").unwrap())
             .await
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn configured_plugin_discovery_warns_once_for_invalid_default_prompt() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugin");
+    let long_prompt = "x".repeat(129);
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        &format!(
+            r#"{{
+  "name": "plugin",
+  "mcpServers": {{
+    "demo": {{ "command": "demo-server" }}
+  }},
+  "interface": {{
+    "defaultPrompt": ["{long_prompt}"]
+  }}
+}}"#
+        ),
+    );
+
+    let buffer: &'static Mutex<Vec<u8>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(/*ansi*/ false)
+        .with_writer(MockWriter::new(buffer))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let servers = load_plugin_mcp_servers(
+        &plugin_root,
+        &PluginId::parse("plugin@test").expect("plugin id"),
+        Some(AuthMode::Chatgpt),
+    )
+    .await;
+
+    assert!(servers.contains_key("demo"));
+    let logs = String::from_utf8(buffer.lock().expect("log buffer").clone())
+        .expect("captured logs are UTF-8");
+    assert_eq!(
+        logs.matches("ignoring interface.defaultPrompt[0]: prompt must be at most 128 characters")
+            .count(),
+        1
     );
 }
 

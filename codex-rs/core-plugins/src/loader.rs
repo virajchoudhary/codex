@@ -1516,12 +1516,28 @@ async fn load_plugin_mcp_servers_with_policy(
     auth_mode: Option<AuthMode>,
     plugin_policy: Option<&HashMap<String, PluginMcpServerConfig>>,
 ) -> HashMap<String, McpServerConfig> {
-    let mut mcp_servers = load_declared_plugin_mcp_servers(plugin_root, plugin_policy).await;
+    let Some(loaded_manifest) = load_plugin_manifest_with_format(plugin_root) else {
+        return HashMap::new();
+    };
+    let manifest_paths = loaded_manifest.manifest.paths;
+    let manifest_format = loaded_manifest.format;
+    let mut mcp_servers = load_plugin_mcp_servers_from_manifest_with_format(
+        plugin_root,
+        &manifest_paths,
+        plugin_policy,
+        /*plugin_data_root*/ None,
+        manifest_format,
+    )
+    .await;
     if !apps_route_available(auth_mode) || mcp_servers.is_empty() {
         return mcp_servers;
     }
 
-    let mut app_declarations = load_plugin_apps(plugin_root, plugin_id).await;
+    let mut app_declarations = if plugin_supports_apps(manifest_format, plugin_id) {
+        load_plugin_apps_from_manifest(plugin_root, &manifest_paths).await
+    } else {
+        Vec::new()
+    };
     apply_app_mcp_routing_policy(
         &mut app_declarations,
         &mut mcp_servers,
@@ -1529,24 +1545,6 @@ async fn load_plugin_mcp_servers_with_policy(
         /*plugin_active*/ true,
     );
     mcp_servers
-}
-
-async fn load_declared_plugin_mcp_servers(
-    plugin_root: &Path,
-    plugin_policy: Option<&HashMap<String, PluginMcpServerConfig>>,
-) -> HashMap<String, McpServerConfig> {
-    let Some(loaded_manifest) = load_plugin_manifest_with_format(plugin_root) else {
-        return HashMap::new();
-    };
-
-    load_plugin_mcp_servers_from_manifest_with_format(
-        plugin_root,
-        &loaded_manifest.manifest.paths,
-        plugin_policy,
-        /*plugin_data_root*/ None,
-        loaded_manifest.format,
-    )
-    .await
 }
 
 pub(crate) async fn load_plugin_mcp_servers_from_manifest_with_format(
