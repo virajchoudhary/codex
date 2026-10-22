@@ -629,6 +629,7 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
     );
     let listed = crate::list_hooks(crate::HooksConfig {
         legacy_notify_argv: None,
+        notify_payload_transport: codex_config::config_toml::NotifyPayloadTransport::Argv,
         feature_enabled: true,
         bypass_hook_trust: false,
         config_layer_stack: Some(config_layer_stack.clone()),
@@ -2111,6 +2112,7 @@ print(json.dumps({
     assert_eq!(preview[0].source_path, source_path);
     let listed = crate::list_hooks(crate::HooksConfig {
         legacy_notify_argv: None,
+        notify_payload_transport: codex_config::config_toml::NotifyPayloadTransport::Argv,
         feature_enabled: true,
         bypass_hook_trust: false,
         config_layer_stack: None,

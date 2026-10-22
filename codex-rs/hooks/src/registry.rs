@@ -30,6 +30,7 @@ use crate::types::HookPayload;
 use crate::types::HookResponse;
 use async_channel::Receiver;
 use codex_config::ConfigLayerStack;
+use codex_config::config_toml::NotifyPayloadTransport;
 use codex_plugin::ExecutorPluginHookSource;
 use codex_plugin::PluginHookSource;
 use codex_protocol::ThreadId;
@@ -45,6 +46,7 @@ use tokio::process::Command;
 #[derive(Default, Clone)]
 pub struct HooksConfig {
     pub legacy_notify_argv: Option<Vec<String>>,
+    pub notify_payload_transport: NotifyPayloadTransport,
     pub feature_enabled: bool,
     pub bypass_hook_trust: bool,
     pub config_layer_stack: Option<ConfigLayerStack>,
@@ -135,7 +137,13 @@ impl Hooks {
         let after_agent = config
             .legacy_notify_argv
             .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
-            .map(|argv| crate::legacy_notify::notify_hook(argv, Arc::clone(&environment)))
+            .map(|argv| {
+                crate::legacy_notify::notify_hook(
+                    argv,
+                    Arc::clone(&environment),
+                    config.notify_payload_transport,
+                )
+            })
             .into_iter()
             .collect();
         let command_runtime = build_runtime(CommandShell {

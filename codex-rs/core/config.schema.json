@@ -3454,6 +3454,14 @@
         }
       ]
     },
+    "NotifyPayloadTransport": {
+      "description": "Transport used to deliver the payload to the legacy `notify` command.",
+      "enum": [
+        "argv",
+        "stdin"
+      ],
+      "type": "string"
+    },
     "OAuthCredentialsStoreMode": {
       "description": "Determine where Codex should store and read MCP credentials.",
       "oneOf": [
@@ -8040,6 +8048,15 @@
         "type": "string"
       },
       "type": "array"
+    },
+    "notify_payload_transport": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/NotifyPayloadTransport"
+        }
+      ],
+      "default": "argv",
+      "description": "Transport used for the legacy `notify` payload. Defaults to `argv`."
     },
     "openai_base_url": {
       "description": "Base URL override for the built-in `openai` model provider.",
