@@ -16,6 +16,33 @@ fn remote_target() -> AppServerTarget {
     }
 }
 
+fn normalize_startup_footer_cwd(rendered: &str) -> String {
+    let footer_line = rendered
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("  ") && line.contains(" · "))
+        .expect("startup footer includes model, effort, and cwd");
+    let (model_and_effort, cwd) = footer_line
+        .rsplit_once(" · ")
+        .expect("startup footer separates model and cwd");
+    assert!(!cwd.is_empty(), "startup footer includes a cwd");
+
+    rendered.replacen(footer_line, &format!("{model_and_effort} · <PROJECT>"), 1)
+}
+
+#[test]
+fn startup_footer_cwd_normalization_preserves_other_text() {
+    let expected = "› Ask Codex · anything\n\n  unrelated · text\n  GPT-6.1-Sol high · <PROJECT>\n";
+    for cwd in [
+        "/tmp/.tmp123",
+        "~/work/_temp/codex-contribution-verification-39810126584-1…",
+    ] {
+        let rendered =
+            format!("› Ask Codex · anything\n\n  unrelated · text\n  GPT-6.1-Sol high · {cwd}\n");
+        assert_eq!(normalize_startup_footer_cwd(&rendered), expected);
+    }
+}
+
 pub(super) async fn run_startup_for_test(
     tui: &mut crate::tui::Tui,
     initial_backends: InitialBackendSessions,
@@ -582,6 +609,9 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
         )
         .await?;
         assert_eq!(started.session.model, selected_model);
+        if !remote {
+            assert_eq!(started.session.cwd.as_path(), destination.path());
+        }
         assert!(
             !started
                 .session
@@ -608,8 +638,10 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
         let (mut app, _, _) = make_test_app_with_channels().await;
         app.chat_widget.handle_thread_session_quiet(started.session);
         if !remote {
-            let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80)
-                .replace(&destination.path().display().to_string(), "<PROJECT>");
+            let rendered = normalize_startup_footer_cwd(&render_bottom_popup(
+                &app.chat_widget,
+                /*width*/ 80,
+            ));
             insta::assert_snapshot!(rendered, @r"
             › Ask Codex to do anything
 
