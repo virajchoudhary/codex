@@ -3,6 +3,7 @@
 
 use crate::error::ApiError;
 use crate::error::parse_flex_unavailable;
+use crate::error::parse_invalid_encrypted_content;
 use crate::responses_headers::json_headers_to_http_headers;
 use codex_http_client::RetryAfter;
 use codex_protocol::protocol::MisalignmentErrorDetails;
@@ -30,6 +31,9 @@ pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
         .and_then(Value::as_object)
         .and_then(|headers| RetryAfter::from_headers(&json_headers_to_http_headers(headers)));
     if let Some(error) = error.and_then(parse_flex_unavailable) {
+        return error;
+    }
+    if let Some(error) = error.and_then(parse_invalid_encrypted_content) {
         return error;
     }
     let Some(error) = error.and_then(|error| serde_json::from_value::<Error>(error.clone()).ok())

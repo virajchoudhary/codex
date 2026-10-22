@@ -6,6 +6,8 @@ use crate::common::ResponsesWsRequest;
 use crate::common::SafetyBufferingTreatment;
 use crate::common::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
 use crate::error::ApiError;
+use crate::error::INVALID_ENCRYPTED_CONTENT_ERROR_CODE;
+use crate::error::invalid_encrypted_content_error;
 use crate::provider::Provider;
 use crate::rate_limits::parse_rate_limit_event;
 use crate::responses_headers::json_headers_to_http_headers;
@@ -656,6 +658,12 @@ fn map_wrapped_websocket_error_event(
         headers,
         ..
     } = event;
+    if status.is_none_or(|status| status == StatusCode::BAD_REQUEST.as_u16())
+        && error.as_ref().and_then(|error| error.code.as_deref())
+            == Some(INVALID_ENCRYPTED_CONTENT_ERROR_CODE)
+    {
+        return Some(invalid_encrypted_content_error());
+    }
     let retry_after = [
         error
             .as_ref()
@@ -1292,6 +1300,40 @@ mod tests {
         };
         assert_eq!(message, WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE);
         assert_eq!(retry_after, None);
+    }
+
+    #[test]
+    fn parse_wrapped_websocket_invalid_encrypted_content_is_redacted_and_terminal() {
+        let opaque_content = "synthetic-private-ciphertext";
+        for status in [None, Some(StatusCode::BAD_REQUEST.as_u16())] {
+            let mut payload = json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "invalid_encrypted_content",
+                    "message": format!("Encrypted content {opaque_content} could not be verified.")
+                }
+            });
+            if let Some(status) = status {
+                payload["status"] = json!(status);
+            }
+            let payload = payload.to_string();
+            let wrapped_error = parse_wrapped_websocket_error_event(&payload)
+                .expect("expected websocket error payload to be parsed");
+            let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+                .expect("expected encrypted-content rejection to map to ApiError");
+            let error = crate::api_bridge::map_api_error(api_error);
+
+            let codex_protocol::error::CodexErrorDetails::InvalidRequest(message) = error.details()
+            else {
+                panic!("expected a terminal invalid-request error, got {error:?}");
+            };
+            assert!(
+                !message.contains(opaque_content),
+                "the server's opaque ciphertext must not reach the client: {message}"
+            );
+            assert_eq!(error.retry_delay(/*retry_count*/ 1), None);
+        }
     }
 
     #[test]
