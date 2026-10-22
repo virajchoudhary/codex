@@ -35,11 +35,11 @@ jobs:
         with:
           components: clippy,rustfmt,rust-src
 
-      - name: Run scoped Windows tests
+      - name: Run remaining Windows TUI tests
         shell: pwsh
         env:
           RUST_MIN_STACK: "8388608"
-        run: python -B .github/scripts/run_contribution_verification.py --run --task-root $env:CONTRIB_TASK_ROOT
+        run: python -B .github/scripts/run_contribution_verification.py --run --task-root $env:CONTRIB_TASK_ROOT --tests tui-legacy-resume-history tui-startup-defaults
 
       - name: Upload bounded verification evidence
         if: always()
@@ -76,11 +76,11 @@ jobs:
         with:
           components: clippy,rustfmt,rust-src
 
-      - name: Run scoped macOS tests
+      - name: Run remaining macOS TUI tests
         shell: bash
         env:
           RUST_MIN_STACK: "8388608"
-        run: python3 -B .github/scripts/run_contribution_verification.py --run --task-root "$CONTRIB_TASK_ROOT"
+        run: python3 -B .github/scripts/run_contribution_verification.py --run --task-root "$CONTRIB_TASK_ROOT" --tests tui-legacy-resume-history tui-startup-defaults
 
       - name: Upload bounded verification evidence
         if: always()

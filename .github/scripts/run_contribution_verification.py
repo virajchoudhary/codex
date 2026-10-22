@@ -258,6 +258,40 @@ def build_test_commands(platform_name: str) -> list[TestCommand]:
     return commands
 
 
+def select_test_commands(
+    platform_name: str,
+    requested_tests: Sequence[str] | None = None,
+) -> list[TestCommand]:
+    commands = build_test_commands(platform_name)
+    if requested_tests is None:
+        return commands
+
+    requested_names = list(requested_tests)
+    if not requested_names:
+        raise VerificationError("test selection must include at least one name")
+
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for name in requested_names:
+        if name in seen:
+            duplicates.append(name)
+        else:
+            seen.add(name)
+    duplicates = list(dict.fromkeys(duplicates))
+    if duplicates:
+        raise VerificationError(f"duplicate test name(s): {', '.join(duplicates)}")
+
+    command_names = {command.name for command in commands}
+    unknown_names = list(
+        dict.fromkeys(name for name in requested_names if name not in command_names)
+    )
+    if unknown_names:
+        raise VerificationError(f"unknown test name(s): {', '.join(unknown_names)}")
+
+    selected_names = set(requested_names)
+    return [command for command in commands if command.name in selected_names]
+
+
 def parse_test_summary(log_path: Path) -> TestSummary | None:
     found: TestSummary | None = None
     with log_path.open("r", encoding="utf-8", errors="replace") as log:
@@ -929,8 +963,13 @@ def _summary_dict(summary: TestSummary | None) -> dict[str, int | str] | None:
     return {**asdict(summary), "executed": summary.executed}
 
 
-def run_verification(task_root_text: str) -> int:
+def run_verification(
+    task_root_text: str,
+    requested_tests: Sequence[str] | None = None,
+) -> int:
     platform_name = sys.platform
+    requested_names = None if requested_tests is None else list(requested_tests)
+    commands = select_test_commands(platform_name, requested_names)
     runner_temp = os.environ.get("RUNNER_TEMP")
     if not runner_temp:
         raise VerificationError("RUNNER_TEMP is required")
@@ -952,6 +991,11 @@ def run_verification(task_root_text: str) -> int:
         "started_at": started_at,
         "finished_at": None,
         "rust_toolchain_pin": RUST_VERSION,
+        "verification_scope": (
+            "platform_catalog" if requested_names is None else "selected_commands_only"
+        ),
+        "requested_tests": requested_names,
+        "selected_tests": [spec.name for spec in commands],
         "tool_versions": {},
         "budgets": {
             "max_task_bytes": MAX_TASK_BYTES,
@@ -993,7 +1037,6 @@ def run_verification(task_root_text: str) -> int:
         deadline = time.monotonic() + PROCESS_TIMEOUT_SECONDS
         failures: list[str] = []
         results: list[dict[str, object]] = []
-        commands = build_test_commands(platform_name)
         for spec in commands:
             if time.monotonic() >= deadline:
                 failures.append("55-minute process deadline exceeded")
@@ -1099,12 +1142,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     mode.add_argument("--prepare-environment", action="store_true")
     mode.add_argument("--run", action="store_true")
     parser.add_argument("--task-root", required=True)
+    parser.add_argument("--tests", nargs="+", metavar="NAME")
     args = parser.parse_args(argv)
+    if args.tests is not None and not args.run:
+        parser.error("--tests may be used only with --run")
     try:
         if args.prepare_environment:
             prepare_environment(args.task_root)
             return 0
-        return run_verification(args.task_root)
+        return run_verification(args.task_root, requested_tests=args.tests)
     except (OSError, VerificationError, tomllib.TOMLDecodeError) as exc:
         print(f"contribution verification failed: {exc}", file=sys.stderr)
         return 1

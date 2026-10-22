@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import subprocess
@@ -14,11 +15,13 @@ from run_contribution_verification import (
     CommandResult,
     ResourceLimitError,
     TestCommand as CommandSpec,
+    TestSummary as SummarySpec,
     VerificationError,
     build_test_commands,
     check_budgets,
     parse_test_summary,
     run_test_command,
+    select_test_commands,
     validate_task_root,
     validate_test_result,
 )
@@ -707,6 +710,162 @@ class RunContributionVerificationTest(unittest.TestCase):
             ),
             1,
         )
+
+    def test_default_selection_returns_the_full_platform_catalog(self) -> None:
+        for platform_name in ("win32", "darwin"):
+            with self.subTest(platform_name=platform_name):
+                self.assertEqual(
+                    select_test_commands(platform_name),
+                    build_test_commands(platform_name),
+                )
+
+    def test_requested_tests_are_selected_in_catalog_order(self) -> None:
+        selected = select_test_commands(
+            "win32",
+            [
+                "tui-startup-defaults",
+                "tui-legacy-resume-history",
+                "model-provider",
+            ],
+        )
+        self.assertEqual(
+            [command.name for command in selected],
+            [
+                "model-provider",
+                "tui-legacy-resume-history",
+                "tui-startup-defaults",
+            ],
+        )
+
+    def test_test_selection_rejects_unknown_names(self) -> None:
+        with self.assertRaisesRegex(VerificationError, "unknown test name"):
+            select_test_commands("win32", ["model-provider", "not-a-test"])
+
+    def test_test_selection_rejects_duplicate_names(self) -> None:
+        with self.assertRaisesRegex(VerificationError, "duplicate test name"):
+            select_test_commands("win32", ["model-provider", "model-provider"])
+
+    def test_test_selection_rejects_an_empty_explicit_list(self) -> None:
+        with self.assertRaisesRegex(VerificationError, "at least one name"):
+            select_test_commands("win32", [])
+
+    def test_cli_forwards_requested_tests_to_run(self) -> None:
+        task_root = r"D:\runner\_temp\contribution"
+        requested_tests = ["tui-startup-defaults", "model-provider"]
+        with patch.object(
+            run_contribution_verification, "run_verification", return_value=0
+        ) as run_verification:
+            exit_code = run_contribution_verification.main(
+                [
+                    "--run",
+                    "--task-root",
+                    task_root,
+                    "--tests",
+                    *requested_tests,
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        run_verification.assert_called_once_with(
+            task_root, requested_tests=requested_tests
+        )
+
+    def test_cli_rejects_tests_during_environment_preparation(self) -> None:
+        with patch.object(run_contribution_verification, "prepare_environment") as prep:
+            with self.assertRaises(SystemExit) as raised:
+                run_contribution_verification.main(
+                    [
+                        "--prepare-environment",
+                        "--task-root",
+                        r"D:\runner\_temp\contribution",
+                        "--tests",
+                        "model-provider",
+                    ]
+                )
+        self.assertEqual(raised.exception.code, 2)
+        prep.assert_not_called()
+
+    def test_subset_receipt_records_requested_and_selected_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner_temp = Path(temp_dir)
+            task_root = runner_temp / "run"
+            task_root.mkdir()
+            expected_sha = "a" * 40
+            requested_tests = ["tui-startup-defaults", "model-provider"]
+
+            def run_synthetic_test(
+                spec: CommandSpec,
+                *,
+                task_root: Path,
+                **_kwargs: object,
+            ) -> CommandResult:
+                log_path = task_root / "logs" / f"{spec.name}.log"
+                log_path.write_text(
+                    "test result: ok. 1 passed; 0 failed; 0 ignored; "
+                    "0 measured; 0 filtered out; finished in 0.00s\n",
+                    encoding="utf-8",
+                )
+                return CommandResult(
+                    name=spec.name,
+                    command=list(spec.argv),
+                    return_code=0,
+                    duration_seconds=0.0,
+                    log_path=str(log_path),
+                    log_bytes=log_path.stat().st_size,
+                    log_sha256=None,
+                    summary=SummarySpec("ok", 1, 0, 0, 0, 0),
+                )
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "RUNNER_TEMP": str(runner_temp),
+                        "GITHUB_REPOSITORY": "openai/codex",
+                        "GITHUB_SHA": expected_sha,
+                    },
+                ),
+                patch.object(
+                    run_contribution_verification,
+                    "_validate_managed_environment",
+                    return_value={},
+                ),
+                patch.object(
+                    run_contribution_verification, "_git_sha", return_value=expected_sha
+                ),
+                patch.object(
+                    run_contribution_verification,
+                    "_verify_toolchain",
+                    return_value={},
+                ),
+                patch.object(
+                    run_contribution_verification,
+                    "check_budgets",
+                    return_value=(0, 8_000_000_000),
+                ),
+                patch.object(
+                    run_contribution_verification,
+                    "run_test_command",
+                    side_effect=run_synthetic_test,
+                ),
+            ):
+                exit_code = run_contribution_verification.run_verification(
+                    str(task_root), requested_tests=requested_tests
+                )
+
+            receipt_path = task_root / "evidence" / "verification.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(receipt["result"], "passed")
+            self.assertEqual(receipt["verification_scope"], "selected_commands_only")
+            self.assertEqual(receipt["requested_tests"], requested_tests)
+            self.assertEqual(
+                receipt["selected_tests"],
+                ["model-provider", "tui-startup-defaults"],
+            )
+            self.assertEqual(
+                [result["name"] for result in receipt["tests"]],
+                receipt["selected_tests"],
+            )
 
 
 if __name__ == "__main__":
