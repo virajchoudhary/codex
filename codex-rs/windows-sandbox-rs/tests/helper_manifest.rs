@@ -2,9 +2,10 @@
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_utils_cargo_bin::cargo_bin;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::process::Command;
 use windows_sys::Win32::Foundation::FreeLibrary;
 use windows_sys::Win32::System::LibraryLoader::FindResourceW;
 use windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_AS_DATAFILE;
@@ -19,11 +20,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::RT_MANIFEST;
 /// The setup executable must expose an asInvoker manifest through the Windows resource API.
 #[test]
 fn setup_helper_embeds_as_invoker_manifest() -> Result<()> {
-    let setup_executable = std::env::var_os("CARGO_BIN_EXE_codex-windows-sandbox-setup")
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_codex_windows_sandbox_setup"))
-        .map(PathBuf::from)
-        .or_else(|| option_env!("CARGO_BIN_EXE_codex-windows-sandbox-setup").map(PathBuf::from))
-        .context("locate the Windows sandbox setup executable")?;
+    let setup_executable = cargo_bin("codex-windows-sandbox-setup")?;
     std::fs::metadata(&setup_executable)
         .with_context(|| format!("find setup helper {}", setup_executable.display()))?;
     let setup_path = setup_executable
@@ -79,5 +76,38 @@ fn setup_helper_embeds_as_invoker_manifest() -> Result<()> {
         return Err(io::Error::last_os_error()).context("unload setup helper resource module");
     }
 
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires REPOSITORY_NAME at compile time to emulate Bazel runfiles"]
+fn setup_helper_manifest_resolves_logical_runfile() -> Result<()> {
+    let setup_executable = cargo_bin("codex-windows-sandbox-setup")?;
+    let directory = tempfile::tempdir()?;
+    let manifest = directory.path().join("runfiles_manifest");
+    let logical_path = "_main/codex-rs/windows-sandbox-rs/codex-windows-sandbox-setup.exe";
+    std::fs::write(
+        &manifest,
+        format!("{logical_path} {}\n", setup_executable.display()),
+    )?;
+    let output = Command::new(std::env::current_exe()?)
+        .args([
+            "setup_helper_embeds_as_invoker_manifest",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .current_dir(directory.path())
+        .env("CARGO_BIN_EXE_codex-windows-sandbox-setup", logical_path)
+        .env("RUNFILES_MANIFEST_ONLY", "1")
+        .env("RUNFILES_MANIFEST_FILE", &manifest)
+        .env_remove("RUNFILES_DIR")
+        .env_remove("TEST_SRCDIR")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "manifest check failed for a logical runfile:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     Ok(())
 }
