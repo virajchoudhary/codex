@@ -65,6 +65,7 @@ use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadSettingsUpdateResponse;
+use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -1216,6 +1217,145 @@ async fn thread_resume_approval_policy_override_wins_over_persisted_policy() -> 
         AskForApproval::OnRequest,
     )
     .await
+}
+
+#[test_case(ThreadHistoryMode::Legacy; "legacy history")]
+#[test_case(ThreadHistoryMode::Paginated; "paginated history")]
+#[tokio::test]
+async fn loaded_resume_applies_and_persists_permission_overrides(
+    history_mode: ThreadHistoryMode,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let started = mcp
+        .start_thread(ThreadStartParams {
+            history_mode: Some(history_mode),
+            permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
+            approval_policy: Some(AskForApproval::OnRequest),
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+            ..Default::default()
+        })
+        .await?;
+    let thread_id = started.thread.id;
+    let rollout_path = started.thread.path.expect("thread rollout path");
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: thread_id.clone(),
+        input: vec![UserInput::Text {
+            text: "materialize this thread".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    mcp.clear_message_buffer();
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            exclude_turns: true,
+            approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            permissions: Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let resumed: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(resumed.approval_policy, AskForApproval::Never);
+    assert_eq!(resumed.approvals_reviewer, ApprovalsReviewer::User);
+    assert_eq!(resumed.sandbox, AppSandboxPolicy::DangerFullAccess);
+    assert_eq!(
+        resumed.active_permission_profile.map(|profile| profile.id),
+        Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string())
+    );
+
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+    let updated: ThreadSettingsUpdatedNotification =
+        serde_json::from_value(notification.params.expect("settings notification params"))?;
+    assert_eq!(updated.thread_id, thread_id);
+    assert_eq!(
+        updated.thread_settings.approval_policy,
+        AskForApproval::Never
+    );
+    assert_eq!(
+        updated.thread_settings.approvals_reviewer,
+        ApprovalsReviewer::User
+    );
+    assert_eq!(
+        updated.thread_settings.sandbox_policy,
+        AppSandboxPolicy::DangerFullAccess
+    );
+
+    mcp.shutdown_gracefully().await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let restored: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(restored.approval_policy, AskForApproval::Never);
+    assert_eq!(restored.approvals_reviewer, ApprovalsReviewer::User);
+    assert_eq!(restored.sandbox, AppSandboxPolicy::DangerFullAccess);
+    assert_eq!(
+        restored.active_permission_profile.map(|profile| profile.id),
+        Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string())
+    );
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: thread_id.clone(),
+        input: vec![UserInput::Text {
+            text: "continue with accepted permissions".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    mcp.shutdown_gracefully().await?;
+
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    let context = items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::TurnContext(context) => Some(context),
+            _ => None,
+        })
+        .expect("completed turn context");
+    assert_eq!(
+        context.approval_policy,
+        codex_protocol::protocol::AskForApproval::Never
+    );
+    assert_eq!(
+        context.approvals_reviewer,
+        Some(codex_protocol::config_types::ApprovalsReviewer::User)
+    );
+    assert_eq!(
+        context.sandbox_policy,
+        codex_protocol::protocol::SandboxPolicy::DangerFullAccess
+    );
+    assert_eq!(
+        context
+            .active_permission_profile
+            .as_ref()
+            .map(|profile| profile.id.as_str()),
+        Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS)
+    );
+    Ok(())
 }
 
 async fn assert_thread_resume_approval_policy(

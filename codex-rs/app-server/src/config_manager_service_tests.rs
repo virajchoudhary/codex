@@ -2798,7 +2798,14 @@ async fn permission_config_reload_merges_session_layers() -> Result<()> {
     config.config_layer_stack =
         ConfigLayerStack::new(layers, Default::default(), Default::default())?;
     let loaded = service
-        .load_permission_config_for_thread(&config, config.cwd.clone(), "first".to_string())
+        .load_config_for_thread(
+            &config,
+            config.cwd.clone(),
+            codex_core::config::ConfigOverrides {
+                default_permissions: Some("first".to_string()),
+                ..Default::default()
+            },
+        )
         .await?;
     assert_eq!(
         loaded

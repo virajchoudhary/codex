@@ -120,26 +120,26 @@ fn map_additional_context(
 }
 
 #[derive(Default)]
-struct ThreadEnvironmentOverride {
-    environment_requests: Option<TurnEnvironmentRequests>,
+pub(super) struct ThreadEnvironmentOverride {
+    pub(super) environment_requests: Option<TurnEnvironmentRequests>,
     // Only default-environment updates replace the task's separately persisted root selection.
-    runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    pub(super) runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
 }
 
-struct ThreadSettingsBuildParams {
-    method: &'static str,
-    disabled_plugin_ids: Option<Vec<String>>,
-    environment_override: ThreadEnvironmentOverride,
-    approval_policy: Option<codex_app_server_protocol::AskForApproval>,
-    approvals_reviewer: Option<codex_app_server_protocol::ApprovalsReviewer>,
-    sandbox_policy: Option<codex_app_server_protocol::SandboxPolicy>,
-    permissions: Option<String>,
-    model: Option<String>,
-    service_tier: Option<Option<String>>,
-    effort: Option<ReasoningEffort>,
-    summary: Option<ReasoningSummary>,
-    collaboration_mode: Option<CollaborationMode>,
-    personality: Option<Personality>,
+pub(super) struct ThreadSettingsBuildParams {
+    pub(super) method: &'static str,
+    pub(super) disabled_plugin_ids: Option<Vec<String>>,
+    pub(super) environment_override: ThreadEnvironmentOverride,
+    pub(super) approval_policy: Option<codex_app_server_protocol::AskForApproval>,
+    pub(super) approvals_reviewer: Option<codex_app_server_protocol::ApprovalsReviewer>,
+    pub(super) sandbox_policy: Option<codex_app_server_protocol::SandboxPolicy>,
+    pub(super) permissions: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) service_tier: Option<Option<String>>,
+    pub(super) effort: Option<ReasoningEffort>,
+    pub(super) summary: Option<ReasoningSummary>,
+    pub(super) collaboration_mode: Option<CollaborationMode>,
+    pub(super) personality: Option<Personality>,
 }
 
 impl TurnRequestProcessor {
@@ -404,7 +404,6 @@ impl TurnRequestProcessor {
     }
 
     fn normalize_collaboration_mode(
-        &self,
         mut collaboration_mode: CollaborationMode,
     ) -> CollaborationMode {
         if collaboration_mode.settings.developer_instructions.is_none()
@@ -637,26 +636,26 @@ impl TurnRequestProcessor {
                 environment_requests,
             )
             .await;
-        let thread_settings = self
-            .build_thread_settings_overrides(
-                thread.as_ref(),
-                ThreadSettingsBuildParams {
-                    method: "turn/start",
-                    disabled_plugin_ids: params.disabled_plugin_ids,
-                    environment_override,
-                    approval_policy: params.approval_policy,
-                    approvals_reviewer: params.approvals_reviewer,
-                    sandbox_policy: params.sandbox_policy,
-                    permissions: params.permissions,
-                    model: params.model,
-                    service_tier: params.service_tier,
-                    effort: params.effort,
-                    summary: params.summary,
-                    collaboration_mode: params.collaboration_mode,
-                    personality: params.personality,
-                },
-            )
-            .await?;
+        let thread_settings = Self::build_thread_settings_overrides(
+            &self.config_manager,
+            thread.as_ref(),
+            ThreadSettingsBuildParams {
+                method: "turn/start",
+                disabled_plugin_ids: params.disabled_plugin_ids,
+                environment_override,
+                approval_policy: params.approval_policy,
+                approvals_reviewer: params.approvals_reviewer,
+                sandbox_policy: params.sandbox_policy,
+                permissions: params.permissions,
+                model: params.model,
+                service_tier: params.service_tier,
+                effort: params.effort,
+                summary: params.summary,
+                collaboration_mode: params.collaboration_mode,
+                personality: params.personality,
+            },
+        )
+        .await?;
 
         let submission = thread
             .start_or_steer_turn(
@@ -793,8 +792,8 @@ impl TurnRequestProcessor {
         }
     }
 
-    async fn build_thread_settings_overrides(
-        &self,
+    pub(super) async fn build_thread_settings_overrides(
+        config_manager: &crate::config_manager::ConfigManager,
         thread: &CodexThread,
         params: ThreadSettingsBuildParams,
     ) -> Result<codex_protocol::protocol::ThreadSettingsOverrides, JSONRPCErrorError> {
@@ -824,8 +823,7 @@ impl TurnRequestProcessor {
             ));
         }
 
-        let collaboration_mode =
-            collaboration_mode.map(|mode| self.normalize_collaboration_mode(mode));
+        let collaboration_mode = collaboration_mode.map(Self::normalize_collaboration_mode);
         let has_environment_override = environment_requests.is_some();
         // `thread/settings/update` only acknowledges that the update was queued.
         // Clients that send dependent partial updates should wait for
@@ -866,9 +864,15 @@ impl TurnRequestProcessor {
                     || snapshot.cwd().clone(),
                     |environment_requests| environment_requests.legacy_fallback_cwd.clone(),
                 );
-                let config = self
-                    .config_manager
-                    .load_permission_config_for_thread(&thread_config, cwd, permissions)
+                let config = config_manager
+                    .load_config_for_thread(
+                        &thread_config,
+                        cwd,
+                        ConfigOverrides {
+                            default_permissions: Some(permissions),
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .map_err(|error| config_load_error(&error))?;
                 // Startup config is allowed to fall back when requirements
@@ -955,26 +959,26 @@ impl TurnRequestProcessor {
                 /*environment_requests*/ None,
             )
             .await;
-        let thread_settings = self
-            .build_thread_settings_overrides(
-                thread.as_ref(),
-                ThreadSettingsBuildParams {
-                    method: "thread/settings/update",
-                    disabled_plugin_ids: params.disabled_plugin_ids,
-                    environment_override,
-                    approval_policy: params.approval_policy,
-                    approvals_reviewer: params.approvals_reviewer,
-                    sandbox_policy: params.sandbox_policy,
-                    permissions: params.permissions,
-                    model: params.model,
-                    service_tier: params.service_tier,
-                    effort: params.effort,
-                    summary: params.summary,
-                    collaboration_mode: params.collaboration_mode,
-                    personality: params.personality,
-                },
-            )
-            .await?;
+        let thread_settings = Self::build_thread_settings_overrides(
+            &self.config_manager,
+            thread.as_ref(),
+            ThreadSettingsBuildParams {
+                method: "thread/settings/update",
+                disabled_plugin_ids: params.disabled_plugin_ids,
+                environment_override,
+                approval_policy: params.approval_policy,
+                approvals_reviewer: params.approvals_reviewer,
+                sandbox_policy: params.sandbox_policy,
+                permissions: params.permissions,
+                model: params.model,
+                service_tier: params.service_tier,
+                effort: params.effort,
+                summary: params.summary,
+                collaboration_mode: params.collaboration_mode,
+                personality: params.personality,
+            },
+        )
+        .await?;
 
         if thread_settings != codex_protocol::protocol::ThreadSettingsOverrides::default() {
             self.submit_core_op(
