@@ -1,6 +1,7 @@
 use crate::TransportError;
 use crate::error::ApiError;
 use crate::error::parse_flex_unavailable;
+use crate::error::parse_invalid_encrypted_content;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
 use crate::rate_limits::parse_rate_limit_reached_type;
@@ -119,6 +120,14 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                         }
                         _ => {}
                     }
+                }
+
+                if status == http::StatusCode::BAD_REQUEST
+                    && let Ok(value) = serde_json::from_str::<Value>(&body_text)
+                    && let Some(error) =
+                        value.get("error").and_then(parse_invalid_encrypted_content)
+                {
+                    return map_api_error(error);
                 }
 
                 if (status == http::StatusCode::BAD_REQUEST

@@ -476,7 +476,11 @@ fn map_api_error_preserves_misalignment_details_from_wrapped_websocket_error() {
 
 #[test]
 fn map_api_error_keeps_other_400_errors_generic() {
-    for code in ["invalid_request", "some_other_policy"] {
+    for code in [
+        "invalid_request",
+        "invalid_encrypted_content_suffix",
+        "some_other_policy",
+    ] {
         let body = serde_json::json!({
             "error": {
                 "message": "Some other bad request.",
@@ -497,6 +501,34 @@ fn map_api_error_keeps_other_400_errors_generic() {
         };
         assert_eq!(message, &body);
     }
+}
+
+#[test]
+fn map_api_error_redacts_invalid_encrypted_content_http_rejection() {
+    let opaque_content = "synthetic-private-ciphertext";
+    let body = serde_json::json!({
+        "error": {
+            "code": "invalid_encrypted_content",
+            "message": format!("Encrypted content {opaque_content} could not be verified.")
+        }
+    })
+    .to_string();
+    let error = map_api_error(ApiError::Transport(TransportError::Http {
+        retry_after: None,
+        status: http::StatusCode::BAD_REQUEST,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    let CodexErrorDetails::InvalidRequest(message) = error.details() else {
+        panic!("expected CodexErrorDetails::InvalidRequest, got {error:?}");
+    };
+    assert!(
+        !message.contains(opaque_content),
+        "the server's opaque ciphertext must not reach the client: {message}"
+    );
+    assert_eq!(error.retry_delay(/*retry_count*/ 1), None);
 }
 
 #[test]

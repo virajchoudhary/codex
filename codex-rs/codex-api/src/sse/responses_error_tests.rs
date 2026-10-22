@@ -154,3 +154,30 @@ async fn retry_header_does_not_override_terminal_errors() {
         assert_eq!(error.retry_delay(/*retry_count*/ 1), None, "{code}");
     }
 }
+
+#[test]
+fn invalid_encrypted_content_failure_is_redacted_and_not_retried() {
+    let opaque_content = "synthetic-private-ciphertext";
+    let event = serde_json::from_value(json!({
+        "type": "response.failed",
+        "response": {
+            "error": {
+                "code": "invalid_encrypted_content",
+                "message": format!("Encrypted content {opaque_content} could not be verified."),
+                "headers": {"retry-after": "1"}
+            }
+        }
+    }))
+    .expect("failed response event");
+    let error = map_api_error(process_responses_event(event).unwrap_err().into_api_error());
+
+    let codex_protocol::error::CodexErrorDetails::InvalidRequest(message) = error.details() else {
+        panic!("expected a terminal invalid-request error, got {error:?}");
+    };
+    assert!(
+        !message.contains(opaque_content),
+        "the server's opaque ciphertext must not reach the client: {message}"
+    );
+    assert_eq!(error.retry_after(), None);
+    assert_eq!(error.retry_delay(/*retry_count*/ 1), None);
+}

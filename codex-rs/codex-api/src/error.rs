@@ -67,6 +67,21 @@ pub(crate) fn parse_flex_unavailable(error: &Value) -> Option<ApiError> {
         .then_some(ApiError::FlexUnavailable)
 }
 
+pub(crate) const INVALID_ENCRYPTED_CONTENT_ERROR_CODE: &str = "invalid_encrypted_content";
+const INVALID_ENCRYPTED_CONTENT_ERROR_MESSAGE: &str =
+    "The service could not verify encrypted content in this request.";
+
+pub(crate) fn invalid_encrypted_content_error() -> ApiError {
+    ApiError::InvalidRequest {
+        message: INVALID_ENCRYPTED_CONTENT_ERROR_MESSAGE.to_string(),
+    }
+}
+
+pub(crate) fn parse_invalid_encrypted_content(error: &Value) -> Option<ApiError> {
+    (error.get("code").and_then(Value::as_str) == Some(INVALID_ENCRYPTED_CONTENT_ERROR_CODE))
+        .then(invalid_encrypted_content_error)
+}
+
 impl From<crate::AuthError> for ApiError {
     fn from(error: crate::AuthError) -> Self {
         Self::Transport(error.into())
